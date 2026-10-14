@@ -43,6 +43,8 @@ from core.serializers import (
     StudyPendingConsentsSerializer,
 )
 from core.services.jhe_settings import get_setting
+from core.services.observation_import import MAX_RECORDS as MAX_IMPORT_RECORDS
+from core.services.observation_import import import_records
 
 
 class PatientViewSet(ModelViewSet):
@@ -273,6 +275,29 @@ class PatientViewSet(ModelViewSet):
         patient = self.get_object()
         sources = FhirSource.objects.filter(patient=patient).select_related("data_source").order_by("id")
         return Response(PatientFhirSourceSerializer(sources, many=True).data)
+
+    @action(detail=False, methods=["POST"], url_path="me/import")
+    def import_own_observations(self, request):
+        """POST /api/v1/patients/me/import - store a batch of the patient's own past readings.
+
+        A patient imports into their own record only. See core/services/observation_import.py
+        for the record format.
+        """
+        patient = request.user.get_patient()
+        if not patient:
+            raise PermissionDenied("Current user is not a patient.")
+        records = request.data.get("records")
+        if not isinstance(records, list) or not records:
+            raise ValidationError("records must be a non-empty list.")
+        if len(records) > MAX_IMPORT_RECORDS:
+            raise ValidationError(f"At most {MAX_IMPORT_RECORDS} records per request.")
+        try:
+            report = import_records(patient, records)
+        except IntegrityError:
+            return Response(
+                {"detail": "Another import is storing the same readings. Try again."}, status=status.HTTP_409_CONFLICT
+            )
+        return Response(report)
 
     @action(detail=False, methods=["GET"])
     def me(self, request):
