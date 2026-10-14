@@ -87,6 +87,18 @@ def test_save_identifier_rejects_the_ow_link(patient, patient_client):
     assert not PatientIdentifier.objects.filter(system=OW_USER_ID_SYSTEM).exists()
 
 
+@pytest.mark.parametrize("slash", ["", "/"])
+def test_save_identifier_rejects_a_sign_in_identifier(patient, patient_client, trusted_issuer, slash):
+    """Token exchange signs in whoever holds an identifier under a trusted issuer, so a patient
+    who claimed one would receive the account of the person that issuer meant."""
+    resp = patient_client.post(
+        "/api/v1/ehr-patient-portal/identifier", {"system": trusted_issuer + slash, "value": "25"}
+    )
+
+    assert resp.status_code == 400
+    assert not PatientIdentifier.objects.filter(value="25").exists()
+
+
 def test_connect_page_renders(db, client):
     # AllowAny page; renders even unauthenticated (JS handles auth).
     # `db` is needed because the view reads Patient Access aux_data from the DB.

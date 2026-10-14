@@ -502,3 +502,27 @@ def test_patient_form_cannot_write_an_ow_link(api_client, organization, patient)
 
     assert r.status_code == 200, r.text
     assert patient.get_ow_user_id() is None
+
+
+def test_patient_form_save_keeps_a_sign_in_identifier(api_client, organization, patient, trusted_issuer):
+    """Saving the form must not unlink a patient from the issuer they sign in through."""
+    PatientIdentifier.objects.create(patient=patient, system=trusted_issuer, value="25")
+
+    r = api_client.patch(
+        f"/api/v1/patients/{patient.id}?organizationId={organization.id}", {"identifiers": []}, format="json"
+    )
+
+    assert r.status_code == 200, r.text
+    assert patient.identifiers.filter(system=trusted_issuer, value="25").exists()
+
+
+def test_patient_form_cannot_write_a_sign_in_identifier(api_client, organization, patient, trusted_issuer):
+    """A typed-in value would sign the person that issuer means in as this patient."""
+    r = api_client.patch(
+        f"/api/v1/patients/{patient.id}?organizationId={organization.id}",
+        {"identifiers": [{"system": trusted_issuer + "/", "value": "25"}]},
+        format="json",
+    )
+
+    assert r.status_code == 200, r.text
+    assert not patient.identifiers.exists()

@@ -14,6 +14,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 
+from core.auth import trusted_issuer_systems
 from core.models import (
     OW_USER_ID_SYSTEM,
     CodeableConcept,
@@ -181,13 +182,15 @@ class PatientViewSet(ModelViewSet):
 
         Only POST /api/v1/ow/users writes the OW link, from OW's own answer: a typed-in value could
         point at another patient's OW user, and a form opened before the patient linked OW would
-        otherwise unlink them on save.
+        otherwise unlink them on save. An identifier under a trusted token-exchange issuer signs its
+        holder in, so it is left alone for the same reasons.
         """
-        PatientIdentifier.objects.filter(patient=patient).exclude(system=OW_USER_ID_SYSTEM).delete()
+        kept = {OW_USER_ID_SYSTEM, *trusted_issuer_systems()}
+        PatientIdentifier.objects.filter(patient=patient).exclude(system__in=kept).delete()
         for item in identifiers:
             system = item.get("system")
             value = item.get("value")
-            if system is None or value is None or system == OW_USER_ID_SYSTEM:
+            if system is None or value is None or system in kept:
                 continue
             PatientIdentifier.objects.create(patient=patient, system=system, value=value)
 

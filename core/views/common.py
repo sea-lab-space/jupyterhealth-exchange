@@ -23,7 +23,7 @@ from oauth2_provider.views import TokenView
 from oauthlib.common import Request
 
 from core.auth import IdTokenError, JheOAuth2Validator, account_activation_token, parse_fhir_user, verify_id_token
-from core.models import Practitioner
+from core.models import Patient, Practitioner
 from core.services.jhe_settings import get_setting
 from core.views.patient_facing import patient_facing_config
 
@@ -264,8 +264,8 @@ def token_exchange(request: HttpRequest):
     """RFC 8693 token exchange: trade an EHR-issued OIDC id_token for a JHE token.
 
     The id_token is verified offline against the EHR's JWKS (cross-vendor, relies
-    only on ONC g(10) capabilities). The provider is identified by the fhirUser
-    claim and mapped to a JHE Practitioner through a PractitionerIdentifier whose
+    only on ONC g(10) capabilities). The caller is identified by the fhirUser
+    claim and mapped to a JHE Practitioner or Patient through an identifier whose
     system is the token's issuer, so an id asserted by one EHR never matches a row
     registered for another.
     Ref: https://datatracker.ietf.org/doc/html/rfc8693
@@ -341,26 +341,30 @@ def token_exchange(request: HttpRequest):
     except IdTokenError as e:
         return json_error(str(e), status_code=e.status_code)
 
-    if resource_type != "Practitioner":
-        return json_error("fhirUser is not a Practitioner", status_code=403)
+    profiles = {"Practitioner": Practitioner, "Patient": Patient}
+    if resource_type not in profiles:
+        return json_error("fhirUser is not a Practitioner or Patient", status_code=403)
+    model = profiles[resource_type]
 
     issuer = token_issuer.rstrip("/")
     try:
-        practitioner = (
-            Practitioner.objects.select_related("jhe_user")
+        profile = (
+            model.objects.select_related("jhe_user")
             .filter(identifiers__system__in=(issuer, f"{issuer}/"), identifiers__value=identifier)
             .distinct()
             .get()
         )
-    except Practitioner.DoesNotExist:
-        return json_error("Practitioner not found", status_code=404)
-    except Practitioner.MultipleObjectsReturned:
-        logger.error("Multiple practitioners hold identifier %r from issuer %s", identifier, token_issuer)
-        return json_error("Practitioner not found", status_code=404)
-    user = practitioner.jhe_user
+    except model.DoesNotExist:
+        return json_error(f"{resource_type} not found", status_code=404)
+    except model.MultipleObjectsReturned:
+        logger.error("Multiple %ss hold identifier %r from issuer %s", resource_type.lower(), identifier, token_issuer)
+        return json_error(f"{resource_type} not found", status_code=404)
+    user = profile.jhe_user
+    if user is None:  # a Patient can exist without a JHE login
+        return json_error(f"{resource_type} not found", status_code=404)
 
     # Issue a JHE access token, linked to the authenticated client (oauth_request.client
-    # was set by authenticate_client above) and bound to the resolved Practitioner.
+    # was set by authenticate_client above) and bound to the resolved Practitioner or Patient.
     access_token = secrets.token_urlsafe(32)
     oauth_request.user = user
     validator.save_bearer_token({"access_token": access_token, "scope": "openid"}, oauth_request)
@@ -368,7 +372,8 @@ def token_exchange(request: HttpRequest):
     token_model = AccessToken.objects.get(token=access_token)
     expires_in = int((token_model.expires - timezone.now()).total_seconds())
     logger.info(
-        "Token exchange: issued JHE token for Practitioner %r from issuer %s to client %r",
+        "Token exchange: issued JHE token for %s %r from issuer %s to client %r",
+        resource_type,
         identifier,
         token_issuer,
         getattr(oauth_request.client, "client_id", None),

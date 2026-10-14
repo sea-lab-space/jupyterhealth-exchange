@@ -7,6 +7,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from core.auth import trusted_issuer_systems
 from core.models import OW_USER_ID_SYSTEM, EhrBrandLocation, EhrVendor, PatientIdentifier
 from core.views.patient_facing import patient_facing_config
 
@@ -166,6 +167,8 @@ def save_patient_identifier(request):
         return Response({"error": "system and value are required"}, status=400)
     if system == OW_USER_ID_SYSTEM:
         return Response({"error": "The Open Wearables link is set by connecting Open Wearables"}, status=400)
+    if system in trusted_issuer_systems():
+        return Response({"error": "An identifier that signs a patient in is set by an administrator"}, status=400)
 
     identifier, created = PatientIdentifier.objects.get_or_create(
         system=system, value=value, defaults={"patient": patient}

@@ -80,6 +80,22 @@ def patient(organization):
 
 
 @pytest.fixture
+def trusted_issuer(db):
+    """An issuer the token exchange trusts, so identifiers under it sign their holder in."""
+    from django.core.cache import cache
+
+    from core.models import JheSetting
+
+    issuer = "https://app.example.org"
+    setting = JheSetting.objects.create(key="auth.sof.trusted_issuers", value_type="json")
+    setting.set_value("json", [issuer])
+    setting.save()
+    cache.delete("jhe_setting:auth.sof.trusted_issuers")
+    yield issuer
+    cache.delete("jhe_setting:auth.sof.trusted_issuers")  # the rollback does not reach the cache
+
+
+@pytest.fixture
 def hr_study(organization, user, patient):
     study = create_study(
         organization=organization,

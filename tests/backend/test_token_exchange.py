@@ -7,7 +7,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from core import auth
-from core.models import PractitionerIdentifier
+from core.models import Patient, PatientIdentifier, PractitionerIdentifier
 
 ISS = "https://ehr.example.org/fhir"
 AUD = "smart-client-id"
@@ -224,10 +224,41 @@ def test_unknown_practitioner_not_found(client, db, rsa_private_pem):
     assert r.status_code == 404
 
 
-def test_non_practitioner_fhir_user_forbidden(client, user, rsa_private_pem):
+def test_fhir_user_neither_practitioner_nor_patient_forbidden(client, user, rsa_private_pem):
+    priv, _ = rsa_private_pem
+    r = post(client, make_token(priv, fhir_user="RelatedPerson/test-practitioner"))
+    assert r.status_code == 403
+
+
+def test_patient_id_token_issues_a_token_for_the_patient(client, patient, sof_client, rsa_private_pem):
+    from oauth2_provider.models import get_access_token_model
+
+    PatientIdentifier.objects.create(patient=patient, system=ISS, value="test-patient")
+    priv, _ = rsa_private_pem
+
+    r = post(client, make_token(priv, fhir_user="Patient/test-patient"))
+
+    assert r.status_code == 200, r.content
+    tok = get_access_token_model().objects.get(token=r.json()["access_token"])
+    assert tok.application_id == sof_client.id
+    assert tok.user_id == patient.jhe_user_id
+
+
+def test_practitioner_id_does_not_match_a_patient(client, user, rsa_private_pem):
+    """The fhirUser type picks the table: a Patient claim never resolves to a practitioner's id."""
     priv, _ = rsa_private_pem
     r = post(client, make_token(priv, fhir_user="Patient/test-practitioner"))
-    assert r.status_code == 403
+    assert r.status_code == 404
+
+
+def test_patient_without_a_jhe_login_not_found(client, organization, rsa_private_pem):
+    patient = Patient.objects.create(name_family="No", name_given="Login")
+    PatientIdentifier.objects.create(patient=patient, system=ISS, value="test-patient")
+    priv, _ = rsa_private_pem
+
+    r = post(client, make_token(priv, fhir_user="Patient/test-patient"))
+
+    assert r.status_code == 404
 
 
 def test_same_id_from_another_trusted_issuer_not_found(client, user, rsa_private_pem):

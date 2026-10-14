@@ -26,6 +26,8 @@ from django.urls import reverse
 from oauth2_provider.oauth2_validators import OAuth2Validator
 from six import text_type
 
+from core.services.jhe_settings import get_setting
+
 logger = logging.getLogger(__name__)
 
 
@@ -184,3 +186,10 @@ def parse_fhir_user(fhir_user: str) -> tuple[str, str]:
     if len(parts) < 2 or not parts[-1] or not parts[-2]:
         raise IdTokenError(f"Malformed fhirUser reference: {fhir_user!r}", status_code=400)
     return parts[-2], parts[-1]
+
+
+def trusted_issuer_systems() -> set[str]:
+    """Identifier systems the token exchange signs people in by: each trusted issuer, with and
+    without its trailing slash. Only an administrator may write an identifier under one."""
+    issuers = get_setting("auth.sof.trusted_issuers", []) or []
+    return {system for i in issuers for system in (i.rstrip("/"), i.rstrip("/") + "/")}
