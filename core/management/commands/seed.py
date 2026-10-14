@@ -235,6 +235,9 @@ class Command(BaseCommand):
                 ["https://fhir.epic.com/interconnect-fhir-oauth/oauth2"],
             ),
             ("auth.sof.trusted_audience", "json", ["77849e74-8e2a-4c2f-826c-bdbef6da3357"]),
+            # Trusted issuers whose id_tokens may also create the Practitioner or Patient they
+            # name, the first time JHE sees them. Their tokens must carry an email claim.
+            ("auth.sof.provisioning_issuers", "json", []),
             # Open Wearables polling pipeline (see ow_poll management command).
             ("module.ow", "bool", False),
             ("ow.sync_in_progress", "string", ""),

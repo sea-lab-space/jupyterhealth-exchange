@@ -282,6 +282,7 @@ OAUTH2_PROVIDER_APPLICATION_MODEL = "oauth2_provider.Application"
 # core/management/commands/seed.py and https://jupyterhealth.github.io/software-documentation/jhe/provider-ehr-launch :
 #   auth.sof.trusted_issuers  (json array) — trusted EHR OIDC issuers (id_token `iss`)
 #   auth.sof.trusted_audience (json array)     — the SMART apps' client_id at the EHR (id_token `aud`)
+#   auth.sof.provisioning_issuers (json array) — trusted issuers whose id_tokens may create the user they name
 
 X_FRAME_OPTIONS = os.getenv("X_FRAME_OPTIONS", "SAMEORIGIN")
 

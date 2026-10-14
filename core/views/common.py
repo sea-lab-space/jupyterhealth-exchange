@@ -10,6 +10,7 @@ from django.contrib import messages
 from django.contrib.auth import authenticate, get_user_model, login
 from django.contrib.auth import logout as django_logout
 from django.contrib.auth.views import LoginView as BaseLoginView
+from django.db import IntegrityError, transaction
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
 from django.urls import reverse
@@ -258,6 +259,34 @@ class JheTokenView(TokenView):
             )
 
 
+def _create_profile(resource_type, issuer, identifier, claims):
+    """Create the user an id_token names, the first time an issuer in auth.sof.provisioning_issuers
+    sends them, with no usable password: they only ever sign in through the exchange.
+
+    From then on they are found by the identifier, never by email. An issuer that could claim an
+    existing user by naming their email could take over that account, so a taken email is refused.
+    """
+    email = (claims.get("email") or "").strip()
+    if not email:
+        raise IdTokenError("id_token has no email claim to create the user with", status_code=400)
+    if User.objects.filter(email__iexact=email).exists():
+        raise IdTokenError("Another user already has this email", status_code=409)
+    try:
+        with transaction.atomic():
+            user = User.objects.create_user(
+                email=email,
+                user_type=resource_type.lower(),
+                first_name=claims.get("given_name") or "",
+                last_name=claims.get("family_name") or "",
+            )
+            profile = user.practitioner if resource_type == "Practitioner" else user.patient
+            profile.identifiers.create(system=issuer, value=identifier)
+    except IntegrityError:  # a concurrent exchange created them first
+        raise IdTokenError(f"{resource_type} is being created, try again", status_code=409)
+    logger.info("Token exchange: created %s %r from issuer %s", resource_type, identifier, issuer)
+    return profile
+
+
 @csrf_exempt
 @require_POST
 def token_exchange(request: HttpRequest):
@@ -267,7 +296,8 @@ def token_exchange(request: HttpRequest):
     only on ONC g(10) capabilities). The caller is identified by the fhirUser
     claim and mapped to a JHE Practitioner or Patient through an identifier whose
     system is the token's issuer, so an id asserted by one EHR never matches a row
-    registered for another.
+    registered for another. An issuer in auth.sof.provisioning_issuers may also name
+    someone JHE has not seen yet, who is then created (_create_profile).
     Ref: https://datatracker.ietf.org/doc/html/rfc8693
     """
     _id_token_type = "urn:ietf:params:oauth:token-type:id_token"
@@ -355,7 +385,13 @@ def token_exchange(request: HttpRequest):
             .get()
         )
     except model.DoesNotExist:
-        return json_error(f"{resource_type} not found", status_code=404)
+        provisioning_issuers = get_setting("auth.sof.provisioning_issuers", []) or []
+        if issuer not in {i.rstrip("/") for i in provisioning_issuers}:
+            return json_error(f"{resource_type} not found", status_code=404)
+        try:
+            profile = _create_profile(resource_type, issuer, identifier, claims)
+        except IdTokenError as e:
+            return json_error(str(e), status_code=e.status_code)
     except model.MultipleObjectsReturned:
         logger.error("Multiple %ss hold identifier %r from issuer %s", resource_type.lower(), identifier, token_issuer)
         return json_error(f"{resource_type} not found", status_code=404)

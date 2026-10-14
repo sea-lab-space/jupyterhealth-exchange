@@ -87,11 +87,19 @@ def patch_jwks(monkeypatch, rsa_private_pem):
 
 
 def make_token(
-    priv_pem, *, iss=ISS, aud=AUD, fhir_user="Practitioner/test-practitioner", exp_delta=3600, alg="RS256", key=None
+    priv_pem,
+    *,
+    iss=ISS,
+    aud=AUD,
+    fhir_user="Practitioner/test-practitioner",
+    exp_delta=3600,
+    alg="RS256",
+    key=None,
+    **extra_claims,
 ):
     now = int(time.time())
     claims = {"iss": iss, "aud": aud, "sub": "prac-1", "fhirUser": fhir_user, "iat": now, "exp": now + exp_delta}
-    return jwt.encode(claims, key or priv_pem, algorithm=alg)
+    return jwt.encode({**claims, **extra_claims}, key or priv_pem, algorithm=alg)
 
 
 def post(client, token, *, client_id=CLIENT_ID, client_secret=CLIENT_SECRET, http_authorization=None, **overrides):
@@ -259,6 +267,78 @@ def test_patient_without_a_jhe_login_not_found(client, organization, rsa_private
     r = post(client, make_token(priv, fhir_user="Patient/test-patient"))
 
     assert r.status_code == 404
+
+
+@pytest.fixture
+def provisioning(db):
+    """Let ISS create the people its id_tokens name."""
+    from django.core.cache import cache
+
+    from core.models import JheSetting
+
+    setting = JheSetting.objects.create(key="auth.sof.provisioning_issuers", value_type="json")
+    setting.set_value("json", [ISS + "/"])
+    setting.save()
+    cache.delete("jhe_setting:auth.sof.provisioning_issuers")
+    yield
+    cache.delete("jhe_setting:auth.sof.provisioning_issuers")  # the rollback does not reach the cache
+
+
+NEW_PERSON = {"email": "new@example.org", "given_name": "Ada", "family_name": "Lovelace"}
+
+
+@pytest.mark.parametrize("resource_type", ["Practitioner", "Patient"])
+def test_provisioning_issuer_creates_someone_new(client, provisioning, rsa_private_pem, resource_type):
+    from oauth2_provider.models import get_access_token_model
+
+    from core.models import JheUser
+
+    priv, _ = rsa_private_pem
+    token = make_token(priv, fhir_user=f"{resource_type}/new-1", **NEW_PERSON)
+
+    first = post(client, token)
+    again = post(client, token)
+
+    assert first.status_code == 200, first.content
+    assert again.status_code == 200, again.content
+    user = JheUser.objects.get(email="new@example.org")
+    assert (user.user_type, user.first_name, user.last_name) == (resource_type.lower(), "Ada", "Lovelace")
+    assert not user.has_usable_password()
+    profile = user.practitioner if resource_type == "Practitioner" else user.patient
+    assert list(profile.identifiers.values_list("system", "value")) == [(ISS, "new-1")]
+    tokens = get_access_token_model().objects.filter(
+        token__in=[first.json()["access_token"], again.json()["access_token"]]
+    )
+    assert {t.user_id for t in tokens} == {user.id}
+
+
+def test_only_provisioning_issuers_create_people(client, db, rsa_private_pem):
+    from core.models import JheUser
+
+    priv, _ = rsa_private_pem
+    r = post(client, make_token(priv, fhir_user="Patient/new-1", **NEW_PERSON))
+
+    assert r.status_code == 404
+    assert not JheUser.objects.filter(email="new@example.org").exists()
+
+
+def test_creating_someone_needs_an_email(client, provisioning, rsa_private_pem):
+    priv, _ = rsa_private_pem
+    r = post(client, make_token(priv, fhir_user="Patient/new-1"))
+
+    assert r.status_code == 400
+    assert not PatientIdentifier.objects.exists()
+
+
+def test_creating_someone_never_takes_over_an_existing_email(client, provisioning, patient, rsa_private_pem):
+    """Matching by email would let any provisioning issuer sign in as an existing user."""
+    priv, _ = rsa_private_pem
+    email = patient.jhe_user.email.upper()
+
+    r = post(client, make_token(priv, fhir_user="Patient/new-1", email=email))
+
+    assert r.status_code == 409
+    assert not patient.identifiers.exists()
 
 
 def test_same_id_from_another_trusted_issuer_not_found(client, user, rsa_private_pem):
