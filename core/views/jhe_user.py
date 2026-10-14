@@ -46,6 +46,19 @@ class JheUserViewSet(ModelViewSet):
             data["settings"] = request.user.practitioner_profile.settings
         return Response(data)
 
+    @profile.mapping.delete
+    def delete_profile(self, request):
+        """The caller deletes their own account: the user, their Practitioner or Patient, and with
+        a Patient their observations and consents (JheUser.delete). A superuser cannot, so no
+        deployment loses its admin by accident. Nor can a client-credentials token, which acts
+        for the client's owner without being them."""
+        if request.user.is_superuser:
+            return Response({"error": "A superuser cannot delete their own account"}, status=403)
+        if request.auth is not None and request.auth.user_id is None:
+            return Response({"error": "A client's token cannot delete the account that owns it"}, status=403)
+        request.user.delete()
+        return Response(status=204)
+
     @action(detail=False, methods=["GET"])
     def organizations(self, request):
         organizations = Organization.for_practitioner(request.user.id)
