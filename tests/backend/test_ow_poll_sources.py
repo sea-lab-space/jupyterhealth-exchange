@@ -3,7 +3,7 @@
 steps per source and local day and sleep per source and night.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
@@ -43,7 +43,8 @@ class FakeOW:
         self.samples = []
         self.sessions = []
 
-    def sample(self, series, timestamp, value, source, zone_offset="-04:00", is_daily_total=None):
+    def sample(self, series, timestamp, value, source, zone_offset="-04:00", is_daily_total=None, stored=None):
+        """A sample OW stored at ``stored``, by default just before NOW."""
         self.samples.append(
             {
                 "timestamp": timestamp,
@@ -52,6 +53,7 @@ class FakeOW:
                 "value": value,
                 "source": source,
                 "is_daily_total": is_daily_total,
+                "_stored": stored or NOW - timedelta(minutes=1),
             }
         )
 
@@ -75,7 +77,14 @@ class FakeOW:
         path = url.split("/users/user-123/", 1)[1]
         if path == "timeseries":
             low, high = _at(params["start_time"]), _at(params["end_time"])
-            data = [s for s in self.samples if s["type"] == params["types"] and low <= _at(s["timestamp"]) <= high]
+            stored_after = _at(params["created_after"]) if "created_after" in params else None
+            data = [
+                {k: v for k, v in s.items() if k != "_stored"}
+                for s in self.samples
+                if s["type"] == params["types"]
+                and low <= _at(s["timestamp"]) < high
+                and (stored_after is None or s["_stored"] > stored_after)
+            ]
         elif path == "events/sleep":
             low, high = _at(params["start_date"]), _at(params["end_date"])
             data = [s for s in self.sessions if _at(s["start_time"]) >= low and _at(s["end_time"]) < high]
@@ -97,14 +106,15 @@ def ow(db, organization, patient):
     _set_jhe_setting("ow.sync_in_progress", "", "string")
     _set_jhe_setting("ow.api_url", "https://ow.example.test", "string")
     _set_jhe_setting("ow.api_key", "test-key", "string")
+    _set_jhe_setting("ow.poll_window_days", 7, "int")
     yield FakeOW()
     cache.clear()
 
 
-def _poll(ow):
+def _poll(ow, now=NOW):
     with (
         patch("core.management.commands.ow_poll.requests.get", side_effect=ow.get),
-        patch("core.management.commands.ow_poll.timezone.now", return_value=NOW),
+        patch("core.management.commands.ow_poll.timezone.now", return_value=now),
     ):
         call_command("ow_poll", stdout=StringIO())
 
@@ -243,7 +253,7 @@ def test_a_days_total_is_updated_as_it_grows(ow):
 
 
 def test_a_day_the_fetch_holds_only_part_of_is_not_totalled(ow):
-    """The lookback starts 7 days before NOW, on the 5th: earlier days are fetched only in part."""
+    """The first poll's window starts 7 days before NOW, on the 5th: earlier days are fetched only in part."""
     ow.sample("steps", "2026-10-04T20:00:00Z", 100, WATCH)
     ow.sample("steps", "2026-10-05T03:00:00Z", 100, WATCH)  # 23:00 on the 4th, at -04:00
     ow.sample("steps", "2026-10-05T05:00:00Z", 100, WATCH)
@@ -251,6 +261,43 @@ def test_a_day_the_fetch_holds_only_part_of_is_not_totalled(ow):
     _poll(ow)
 
     assert _totals(STEP_COUNT_CODE) == {("Apple Watch", "2026-10-05"): 100}
+
+
+def test_a_day_long_past_is_totalled_again_when_its_steps_arrive(ow):
+    """A phone that was offline for weeks delivers a day older than any lookback, which is
+    totalled again from all its samples, those stored before included."""
+    ow.sample("steps", "2026-09-01T14:00:00Z", 1000, PHONE, stored=NOW - timedelta(days=40))
+    ow.sample("steps", "2026-10-12T10:00:00Z", 100, PHONE)
+    _poll(ow)
+    assert _totals(STEP_COUNT_CODE) == {("iPhone", "2026-10-12"): 100}
+
+    ow.sample("steps", "2026-09-01T15:00:00Z", 500, PHONE, stored=NOW + timedelta(minutes=30))
+    _poll(ow, now=NOW + timedelta(hours=2))
+
+    assert _totals(STEP_COUNT_CODE) == {("iPhone", "2026-10-12"): 100, ("iPhone", "2026-09-01"): 1500}
+
+
+# Reading by arrival
+
+
+def test_a_sample_older_than_the_newest_reading_is_kept_when_it_arrives(ow):
+    """The old JHE resumed from the newest reading, and lost what a phone delivered late."""
+    ow.sample("heart_rate", "2026-10-12T11:00:00Z", 60, WATCH)
+    _poll(ow)
+
+    ow.sample("heart_rate", "2026-10-12T09:00:00Z", 70, PHONE, stored=NOW + timedelta(minutes=30))
+    _poll(ow, now=NOW + timedelta(hours=2))
+
+    values = sorted(obs.omh_data["body"]["heart_rate"]["value"] for obs in _readings("omh:heart-rate:2.0"))
+    assert values == [60, 70]
+
+
+def test_a_reading_is_stored_once_however_often_it_is_read(ow):
+    ow.sample("heart_rate", "2026-10-12T11:00:00Z", 60, WATCH, stored=NOW - timedelta(minutes=10))
+    _poll(ow)
+    _poll(ow, now=NOW + timedelta(minutes=20))  # inside the overlap: the sample is read again
+
+    assert _readings("omh:heart-rate:2.0").count() == 1
 
 
 # Nightly sleep

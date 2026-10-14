@@ -411,56 +411,65 @@ def test_revision_never_overwrites_another_patients_row(db, ow_user, hr_concept)
     assert theirs.omh_data["body"]["heart_rate"]["value"] == 61
 
 
-def test_second_poll_resumes_from_the_last_observation(db, ow_user, patient_with_consent, hr_concept):
-    """Once a row exists, the next poll asks OW from that row's time minus the overlap."""
+def test_second_poll_asks_for_what_arrived_since_the_first(db, ow_user, patient_with_consent, hr_concept):
+    """Once a read completes, the next asks OW for what it stored since, recorded at any time."""
+    from core.management.commands.ow_poll import ARRIVAL_OVERLAP
+
+    _set_jhe_setting("module.ow", True)
+    _clear_sync_lock()
+    first_read = timezone.now() - timedelta(hours=3)
+
+    with patch("core.management.commands.ow_poll.requests.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"data": [], "pagination": {"has_more": False}}
+        with patch("core.management.commands.ow_poll.timezone.now", return_value=first_read):
+            call_command("ow_poll", stdout=StringIO())
+        assert "created_after" not in _heart_rate_params(mock_get)
+
+        mock_get.reset_mock()
+        call_command("ow_poll", stdout=StringIO())
+
+    params = _heart_rate_params(mock_get)
+    assert params["created_after"] == (first_read - ARRIVAL_OVERLAP).isoformat()
+    assert params["start_time"].startswith("2000-01-01")
+
+
+def test_an_incomplete_read_keeps_the_watermark(db, ow_user, patient_with_consent, hr_concept):
+    """A page OW failed to serve is still owed, so the next poll asks from the same place."""
+    from core.models import OwPollWatermark
+
+    _set_jhe_setting("module.ow", True)
+    _clear_sync_lock()
+    first_read = timezone.now() - timedelta(hours=3)
+
+    with patch("core.management.commands.ow_poll.requests.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"data": [], "pagination": {"has_more": False}}
+        with patch("core.management.commands.ow_poll.timezone.now", return_value=first_read):
+            call_command("ow_poll", stdout=StringIO())
+
+        mock_get.return_value.status_code = 503
+        call_command("ow_poll", stdout=StringIO())
+
+    watermark = OwPollWatermark.objects.get(patient=patient_with_consent, ow_type="heart_rate")
+    assert watermark.read_until == first_read
+
+
+def test_days_flag_reads_by_recorded_time_whatever_the_watermark(db, ow_user, patient_with_consent, hr_concept):
+    """A backfill asks for everything recorded in its window, not only what arrived lately."""
     _set_jhe_setting("module.ow", True)
     _clear_sync_lock()
 
-    with (
-        patch("core.management.commands.ow_poll.requests.get") as mock_get,
-        patch("core.management.commands.ow_poll.convert") as mock_convert,
-    ):
+    with patch("core.management.commands.ow_poll.requests.get") as mock_get:
         mock_get.return_value.status_code = 200
-        _serve_heart_rate_only(mock_get)
-        mock_get.return_value.json.return_value = {"data": [{"timestamp": "2024-01-01T00:00:00Z", "x": 1}]}
-        mock_convert.return_value = _fake_omh_record(uuid_value="first-1")
+        mock_get.return_value.json.return_value = {"data": [], "pagination": {"has_more": False}}
         call_command("ow_poll", stdout=StringIO())
-
-        obs = Observation.objects.get()
-        mock_get.reset_mock()
-        mock_convert.return_value = _fake_omh_record(uuid_value="second-1")
-        call_command("ow_poll", stdout=StringIO())
-
-    requested = _requested_start(mock_get)
-    assert requested == obs.effective_date_time - timedelta(minutes=5)
-
-
-def test_late_arriving_sample_is_not_skipped(db, ow_user, patient_with_consent, hr_concept):
-    """A sample measured before the newest row was written must still be fetched."""
-    _set_jhe_setting("module.ow", True)
-    _clear_sync_lock()
-
-    recent = {"timestamp": "2026-09-20T10:00:00+00:00", "type": "heart_rate", "value": 61}
-
-    with (
-        patch("core.management.commands.ow_poll.requests.get") as mock_get,
-        patch("core.management.commands.ow_poll.convert") as mock_convert,
-    ):
-        mock_get.return_value.status_code = 200
-        _serve_heart_rate_only(mock_get)
-        mock_get.return_value.json.return_value = {"data": [recent]}
-        record = _fake_omh_record()
-        record["body"]["effective_time_frame"] = {"date_time": "2026-09-20T10:00:00+00:00"}
-        mock_convert.return_value = record
-        call_command("ow_poll", "--days", "30", stdout=StringIO())
-
-        obs = Observation.objects.get()
         mock_get.reset_mock()
         call_command("ow_poll", "--days", "30", stdout=StringIO())
 
-    requested = _requested_start(mock_get)
-    assert requested < obs.last_updated
-    assert requested == obs.effective_date_time - timedelta(minutes=5)
+    assert "created_after" not in _heart_rate_params(mock_get)
+    age = timezone.now() - _requested_start(mock_get)
+    assert 29 <= age.days <= 30
 
 
 def test_skips_user_without_ow_identifier(db, patient_with_consent, hr_concept):
@@ -771,12 +780,17 @@ def test_convert_is_called_with_a_timezone(db, ow_user, patient_with_consent, hr
     assert mock_convert.call_args.kwargs["tz"] is UTC
 
 
+def _heart_rate_params(mock_get):
+    """The query of the last heart_rate request."""
+    heart_rate = [c for c in mock_get.call_args_list if c.kwargs["params"].get("types") == "heart_rate"]
+    return heart_rate[-1].kwargs["params"]
+
+
 def _requested_start(mock_get):
     """The start_time of the last heart_rate request."""
     from datetime import datetime
 
-    heart_rate = [c for c in mock_get.call_args_list if c.kwargs["params"].get("types") == "heart_rate"]
-    return datetime.fromisoformat(heart_rate[-1].kwargs["params"]["start_time"])
+    return datetime.fromisoformat(_heart_rate_params(mock_get)["start_time"])
 
 
 def test_poll_window_days_setting_widens_the_first_fetch(db, ow_user, patient_with_consent, hr_concept):
@@ -823,9 +837,13 @@ def test_poll_window_defaults_to_one_day(db, ow_user, patient_with_consent, hr_c
 
 
 def test_interval_row_does_not_pin_the_watermark(db, ow_user, patient_with_consent, hr_concept):
-    """An interval body leaves effective_date_time null, which sorts first on a Postgres DESC."""
-    _set_jhe_setting("module.ow", True)
-    _clear_sync_lock()
+    """An interval body leaves effective_date_time null, which sorts first on a Postgres DESC.
+
+    Raw mode resumes from the newest row, so the resume time must skip such rows.
+    """
+    from datetime import datetime
+
+    from core.management.commands.ow_poll import POLL_OVERLAP, RAW_SYSTEM, Command
 
     interval = _fake_omh_record()
     interval["body"]["effective_time_frame"] = {
@@ -836,32 +854,15 @@ def test_interval_row_does_not_pin_the_watermark(db, ow_user, patient_with_conse
     }
     instant = _fake_omh_record()
     instant["body"]["effective_time_frame"] = {"date_time": "2026-09-20T10:00:00+00:00"}
+    command = Command()
+    command._save_observation(patient_with_consent, hr_concept, None, interval, RAW_SYSTEM, "interval")
+    command._save_observation(patient_with_consent, hr_concept, None, instant, RAW_SYSTEM, "instant")
 
-    with (
-        patch("core.management.commands.ow_poll.requests.get") as mock_get,
-        patch("core.management.commands.ow_poll.convert") as mock_convert,
-    ):
-        mock_get.return_value.status_code = 200
-        _serve_heart_rate_only(mock_get)
-        mock_get.return_value.json.return_value = {
-            "data": [{"timestamp": "2020-01-01T00:00:00Z", "type": "heart_rate", "value": 61}]
-        }
-        mock_convert.return_value = interval
-        call_command("ow_poll", "--days", "3000", stdout=StringIO())
-
-        _clear_sync_lock()
-        mock_get.return_value.json.return_value = {
-            "data": [{"timestamp": "2026-09-20T10:00:00Z", "type": "heart_rate", "value": 62}]
-        }
-        mock_convert.return_value = instant
-        call_command("ow_poll", "--days", "3000", stdout=StringIO())
-
-        _clear_sync_lock()
-        mock_get.reset_mock()
-        call_command("ow_poll", "--days", "3000", stdout=StringIO())
+    window_start = datetime.fromisoformat("2018-01-01T00:00:00+00:00")
+    resumed = command._resume_start_time(patient_with_consent, hr_concept, RAW_SYSTEM, window_start)
 
     assert Observation.objects.count() == 2
-    assert _requested_start(mock_get).year == 2026
+    assert resumed == datetime.fromisoformat("2026-09-20T10:00:00+00:00") - POLL_OVERLAP
 
 
 def test_sleep_events_are_fetched_from_the_events_route(db, ow_user, patient_with_consent, organization):
@@ -1078,7 +1079,6 @@ def test_sleep_routes_look_back_past_the_watermark(db):
         "sleep_stage_summary",
         "time_in_bed",
         "sleep_duration",
-        "steps",
         "workout",
         "respiratory_rate",
     }
@@ -1160,3 +1160,56 @@ def test_polls_only_the_oldest_ow_link(db, ow_user, patient_with_consent, hr_con
     requested_urls = [call.args[0] for call in mock_get.call_args_list]
     assert requested_urls
     assert all("/api/v1/users/user-123/" in url for url in requested_urls)
+
+
+def _patient_locks_held():
+    from django.db import connection
+
+    from core.management.commands.ow_poll import _PATIENT_LOCK_CLASS
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT objid FROM pg_locks WHERE locktype = 'advisory' AND classid = %s AND granted"
+            " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            [_PATIENT_LOCK_CLASS],
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+
+def test_a_patient_is_polled_under_their_lock(db, ow_user, patient_with_consent, hr_concept):
+    """Two polls of one patient would write the same rows, so each holds the patient's lock throughout."""
+    from core.management.commands.ow_poll import Command
+
+    _set_jhe_setting("module.ow", True)
+    _clear_sync_lock()
+    held_while_polling = []
+    poll_user = Command._poll_user
+
+    def spy(self, *args, **kwargs):
+        held_while_polling.append(_patient_locks_held())
+        return poll_user(self, *args, **kwargs)
+
+    with (
+        patch.object(Command, "_poll_user", spy),
+        patch("core.management.commands.ow_poll.requests.get") as mock_get,
+    ):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"data": [], "pagination": {"has_more": False}}
+        call_command("ow_poll", stdout=StringIO())
+
+    assert held_while_polling
+    assert all(held == [patient_with_consent.id] for held in held_while_polling)
+    assert _patient_locks_held() == []
+
+
+def test_a_patients_lock_is_released_when_their_poll_fails(db, ow_user, patient_with_consent, hr_concept):
+    _set_jhe_setting("module.ow", True)
+    _clear_sync_lock()
+
+    with (
+        patch("core.models.Patient.consolidated_consented_scopes", side_effect=RuntimeError("boom")),
+        pytest.raises(RuntimeError),
+    ):
+        call_command("ow_poll", stdout=StringIO())
+
+    assert _patient_locks_held() == []

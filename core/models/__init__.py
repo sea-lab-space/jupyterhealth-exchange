@@ -15,6 +15,7 @@ from .jhe_setting import JheSetting
 from .jhe_user import JheUser, JheUserManager
 from .observation import Observation, ObservationIdentifier
 from .organization import Organization
+from .ow_poll_watermark import OwPollWatermark
 from .patient import OW_USER_ID_SYSTEM, Patient, PatientIdentifier, PatientOrganization
 from .patient_invitation import PatientInvitation
 from .practitioner import Practitioner, PractitionerIdentifier, PractitionerOrganization
@@ -42,6 +43,7 @@ __all__ = [
     "Observation",
     "ObservationIdentifier",
     "Organization",
+    "OwPollWatermark",
     "OW_USER_ID_SYSTEM",
     "Patient",
     "PatientIdentifier",

@@ -27,6 +27,8 @@ dependencies = [
     "ipython",
     "boto3",
     "omh-shim==2.1.0",
+    # ow_listen reads Open Wearables' sync events
+    "redis",
 ]
 
 [dependency-groups]

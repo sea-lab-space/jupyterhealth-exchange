@@ -23,6 +23,10 @@ The command no-ops in two situations:
    still running). Locks older than ``LOCK_STALE_AFTER`` are treated as
    abandoned (e.g. crashed worker) and force-reclaimed.
 
+Each patient is also polled under a lock of their own (``_patient_lock``), so
+``ow_listen`` can poll one patient while a full run is going: a poll of the same
+patient waits for the other to finish.
+
 OW connection config (``ow.api_url``, ``ow.api_key``) is read from JheSettings
 via ``get_setting()``, matching ``core/views/ow.py``.
 
@@ -68,14 +72,21 @@ timeseries dedupe key use the OW name; the ``convert()`` call keeps the omh-shim
 ``RAW_SUPPORTED_TYPES`` stays heart rate only. Raw mode has never ingested
 anything (#746), so it is not widened alongside the normalized types.
 
+Timeseries types outside ``LOOKBACK_TYPES``, steps included, are read by arrival:
+each poll asks OW for the samples it stored since the patient's last complete read
+(``OwPollWatermark``), however long ago they were taken, and a day that gained steps
+is totalled again from all of its samples. Resuming from the newest reading instead
+loses what a phone that syncs late delivers.
+
 ``ow.poll_window_days`` (default 1) sets how far back OW is asked for samples.
-It only bounds a patient's first poll: once they have an Observation the resume
-watermark is the later bound, so a wide window costs nothing afterwards. Raise
-it when patients link with device history already recorded, or pass ``--days``
-for a one-off backfill.
+It only bounds a patient's first poll: after it, a type read by arrival resumes
+from its watermark and the others from their newest reading, so a wide window
+costs nothing afterwards. Raise it when patients link with device history already
+recorded, or pass ``--days`` for a one-off backfill, which reads its window
+whatever the watermark says.
 
 ``ow.sleep_lookback_days`` (default 7) sets how far back the ``LOOKBACK_TYPES``
-are refetched on every poll, the daily step totals among them. See ``Fetcher.lookback``.
+are refetched on every poll. See ``Fetcher.lookback``.
 """
 
 import hashlib
@@ -83,13 +94,14 @@ import logging
 import re
 import uuid
 from collections import namedtuple
+from contextlib import contextmanager
 from datetime import UTC, datetime, time, timedelta
 from datetime import timezone as fixed_offset
 
 import requests
 from django.core.cache import cache
 from django.core.management.base import BaseCommand
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from omh_shim import convert
@@ -102,6 +114,7 @@ from core.models import (
     JheUser,
     Observation,
     ObservationIdentifier,
+    OwPollWatermark,
 )
 from core.services.data_sources import source_label
 from core.services.jhe_settings import get_setting
@@ -110,10 +123,16 @@ from core.services.ow_ingest import list_new_objects, read_object
 logger = logging.getLogger(__name__)
 
 POLL_OVERLAP = timedelta(minutes=5)
+# How far back of the last complete read a read by arrival starts. OW stamps a sample when
+# its transaction starts, so a large upload committed after a read began can carry an
+# earlier time than the read; the overlap covers that, and the dedupe key makes it free.
+ARRIVAL_OVERLAP = timedelta(hours=1)
+# A read by arrival asks for samples recorded at any time.
+ARRIVAL_WINDOW_START = datetime(2000, 1, 1, tzinfo=UTC)
 DEFAULT_POLL_WINDOW_DAYS = 1
 DEFAULT_SLEEP_LOOKBACK_DAYS = 7
-PAGE_LIMIT = 100
-MAX_PAGES = 200
+PAGE_LIMIT = 1000
+MAX_PAGES = 1000
 HEART_RATE_CODE = "omh:heart-rate:2.0"
 BLOOD_GLUCOSE_CODE = "omh:blood-glucose:4.0"
 STEP_COUNT_CODE = "omh:step-count:3.0"
@@ -150,16 +169,15 @@ OW_TYPE_TO_SHIM_TYPE = {
     "workout": "physical_activity",
 }
 TOTAL_TYPES = {"steps", "sleep_duration"}
-# How much earlier than its window a total is fetched, so that every local day or night
-# it returns from the window's first UTC date on is whole. A local day starts up to 14
-# hours before the UTC one, and a night's sessions start up to a day before it ends.
+# How much earlier than the first local day or night it totals a total is fetched, so that
+# day or night is whole. A local day starts up to 14 hours before the UTC one, and a night's
+# sessions start up to a day before it ends.
 TOTAL_LEAD = {"steps": timedelta(days=2), "sleep_duration": timedelta(days=3)}
 LOOKBACK_TYPES = {
     "sleep_episode",
     "sleep_stage_summary",
     "time_in_bed",
     "sleep_duration",
-    "steps",
     "workout",
     "respiratory_rate",
 }
@@ -173,12 +191,12 @@ _SYNC_LOCK_KEY = "ow.sync_in_progress"
 # interval (15 min) so a healthy long-running poll is never preempted.
 LOCK_STALE_AFTER = timedelta(minutes=30)
 
-Fetcher = namedtuple("Fetcher", "system records convert dedupe_key source lookback", defaults=(None,))
+Fetcher = namedtuple("Fetcher", "system records convert dedupe_key source lookback by_arrival", defaults=(None, False))
 """One source of samples.
 
 ``system`` is the ObservationIdentifier system its rows are filed under,
-``records`` a callable taking (start_time, end_time) and yielding raw sample
-dicts, ``convert`` a callable turning one record into the OMH data point stored,
+``records`` a callable taking (start_time, end_time, created_after) and yielding
+raw sample dicts, ``convert`` a callable turning one record into the OMH data point stored,
 ``dedupe_key`` a callable taking one record and returning the string that
 identifies it, or None when the record cannot be identified and must be skipped,
 and ``source`` a callable naming the DataSource one record is filed under.
@@ -193,7 +211,22 @@ and grows as they arrive.
 Respiratory rate does because OW files it once per night at the start of sleep
 and rewrites that sample in place when Oura revises the night.
 A source that only ever appends leaves this None and resumes from the watermark.
+
+``by_arrival`` reads what OW stored since the last complete read (``OwPollWatermark``),
+whenever it was recorded, instead. A phone that syncs late delivers samples older
+than the newest one stored, which resuming from the newest one would never fetch.
 """
+
+Run = namedtuple("Run", "mode ow_api_url ow_api_key codes poll_window backfill")
+"""What every patient's poll in one run reads from the settings and the command line."""
+
+# Postgres advisory lock class for "ow_poll is writing this patient"; the patient id is the object.
+_PATIENT_LOCK_CLASS = 7534
+
+
+class IncompleteFetch(Exception):
+    """OW did not hand over every page, so what was read is not all there is."""
+
 
 _ZONE_OFFSET = re.compile(r"([+-])(\d{2}):(\d{2})")
 
@@ -251,6 +284,28 @@ def _data_point(schema_id, body):
         },
         "body": body,
     }
+
+
+@contextmanager
+def _patient_lock(patient):
+    """Hold the patient's advisory lock, waiting for any other poll of them to finish.
+
+    Two polls of one patient would read OW alike and write the same rows; the second one
+    to take the lock reads only what arrived since the first. The lock is the database
+    session's, so a crashed poll releases it.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_lock(%s, %s)", [_PATIENT_LOCK_CLASS, patient.id])
+    try:
+        yield
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_unlock(%s, %s)", [_PATIENT_LOCK_CLASS, patient.id])
+
+
+def _local_day(sample):
+    """The calendar day a timeseries sample was taken on, in its own offset."""
+    return datetime.fromisoformat(sample["timestamp"]).astimezone(_zone(sample.get("zone_offset")) or UTC).date()
 
 
 def _write_sync_lock(value: str) -> None:
@@ -361,28 +416,9 @@ class Command(BaseCommand):
         return timedelta(days=max(days, 1))
 
     def _run_poll(self, options):
-        mode = str(get_setting("ow.ingest_mode", "normalized") or "normalized").lower()
-        if mode not in ("normalized", "raw"):
-            self.stderr.write(f"ow_poll aborted: unknown ow.ingest_mode '{mode}'")
+        run = self.prepare(options)
+        if run is None:
             return
-
-        ow_api_url = (get_setting("ow.api_url", "") or "").rstrip("/")
-        ow_api_key = get_setting("ow.api_key", "")
-        if mode == "normalized" and (not ow_api_url or not ow_api_key):
-            self.stderr.write("ow_poll aborted: ow.api_url / ow.api_key not configured")
-            return
-
-        codes = {}
-        for ow_type, coding_code in OW_TYPE_TO_CODE.items():
-            try:
-                codes[ow_type] = CodeableConcept.objects.get(coding_code=coding_code)
-            except CodeableConcept.DoesNotExist:
-                self.stderr.write(f"CodeableConcept '{coding_code}' not found. Run seed first.")
-        if not codes:
-            return
-
-        self._data_sources = {}
-        poll_window = self._poll_window(options)
 
         users = JheUser.objects.filter(patient_profile__identifiers__system=OW_USER_ID_SYSTEM).distinct()
         patient_id = options.get("patient_id")
@@ -394,25 +430,60 @@ class Command(BaseCommand):
             patient = getattr(user, "patient_profile", None)
             if patient is None:
                 continue
+            total_created += self.poll_patient(patient, run)
+
+        self.stdout.write(
+            self.style.SUCCESS(f"OW poll complete (mode={run.mode}). Created {total_created} observations.")
+        )
+
+    def prepare(self, options):
+        """What every patient's poll needs, or None when the settings do not allow a poll."""
+        mode = str(get_setting("ow.ingest_mode", "normalized") or "normalized").lower()
+        if mode not in ("normalized", "raw"):
+            self.stderr.write(f"ow_poll aborted: unknown ow.ingest_mode '{mode}'")
+            return None
+
+        ow_api_url = (get_setting("ow.api_url", "") or "").rstrip("/")
+        ow_api_key = get_setting("ow.api_key", "")
+        if mode == "normalized" and (not ow_api_url or not ow_api_key):
+            self.stderr.write("ow_poll aborted: ow.api_url / ow.api_key not configured")
+            return None
+
+        codes = {}
+        for ow_type, coding_code in OW_TYPE_TO_CODE.items():
+            try:
+                codes[ow_type] = CodeableConcept.objects.get(coding_code=coding_code)
+            except CodeableConcept.DoesNotExist:
+                self.stderr.write(f"CodeableConcept '{coding_code}' not found. Run seed first.")
+        if not codes:
+            return None
+
+        self._data_sources = {}
+        return Run(mode, ow_api_url, ow_api_key, codes, self._poll_window(options), options.get("days") is not None)
+
+    def poll_patient(self, patient, run):
+        """Poll one patient for every type, under their lock. Returns how many rows were created."""
+        user = patient.jhe_user
+        with _patient_lock(patient):
             consented_codes = {s.coding_code for s in patient.consolidated_consented_scopes()}
-            polled = {t: c for t, c in codes.items() if c.coding_code in consented_codes}
+            polled = {t: c for t, c in run.codes.items() if c.coding_code in consented_codes}
             if not polled:
-                continue
+                return 0
             ow_user_id = patient.get_ow_user_id()
 
+            created = 0
             for ow_type, code in polled.items():
                 try:
-                    if mode == "normalized":
-                        fetcher = self._normalized_fetcher(user, ow_user_id, ow_api_url, ow_api_key, ow_type)
+                    if run.mode == "normalized":
+                        fetcher = self._normalized_fetcher(user, ow_user_id, run.ow_api_url, run.ow_api_key, ow_type)
                     else:
                         fetcher = self._raw_fetcher(user, ow_user_id, ow_type)
                     if fetcher is None:
                         continue
-                    total_created += self._poll_user(user, patient, ow_type, code, fetcher, poll_window)
+                    created += self._poll_user(user, patient, ow_type, code, fetcher, run)
                 except Exception:
                     logger.exception("ow_poll failed for jhe_user_id=%s type=%s", user.id, ow_type)
-
-        self.stdout.write(self.style.SUCCESS(f"OW poll complete (mode={mode}). Created {total_created} observations."))
+            return created
 
     def _fetch_page(self, user, ow_api_url, ow_api_key, ow_user_id, path, params):
         """Yield every OW record across pages.
@@ -421,6 +492,9 @@ class Command(BaseCommand):
         all. ``params`` carries whatever that route needs, because the timeseries
         route windows on ``start_time``/``end_time`` while the events and
         summaries routes window on ``start_date``/``end_date``.
+
+        Raises IncompleteFetch, after yielding what it read, when a page cannot be
+        read or MAX_PAGES runs out, so a caller never takes part for the whole.
         """
         cursor = None
         for _ in range(MAX_PAGES):
@@ -437,7 +511,7 @@ class Command(BaseCommand):
                 )
             except requests.RequestException as e:
                 logger.error("OW request failed for user=%s path=%s: %s", user.id, path, e)
-                return
+                raise IncompleteFetch(path) from e
 
             if resp.status_code != 200:
                 logger.error(
@@ -447,13 +521,13 @@ class Command(BaseCommand):
                     resp.status_code,
                     resp.text[:300],
                 )
-                return
+                raise IncompleteFetch(path)
 
             data = resp.json()
             records = data.get("data", data) if isinstance(data, dict) else data
             if not isinstance(records, list):
                 logger.warning("OW returned non-list payload for user=%s path=%s", user.id, path)
-                return
+                raise IncompleteFetch(path)
             yield from records
 
             pagination = data.get("pagination") or {} if isinstance(data, dict) else {}
@@ -463,6 +537,7 @@ class Command(BaseCommand):
             cursor = next_cursor
 
         logger.warning("OW hit MAX_PAGES for user=%s path=%s", user.id, path)
+        raise IncompleteFetch(path)
 
     def _timeseries_dedupe_key(self, ow_user_id, ow_type, record):
         """Identify one timeseries sample.
@@ -518,14 +593,12 @@ class Command(BaseCommand):
         path = OW_TYPE_TO_ROUTE.get(ow_type, "timeseries")
         if path == "timeseries":
             series = OW_TYPE_TO_SERIES.get(ow_type, ow_type)
-            params = lambda start_time, end_time: {
-                "types": series,
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-            }
+            params = lambda start_time, end_time, created_after: self._timeseries_params(
+                series, start_time, end_time, created_after
+            )
             dedupe_key = lambda record: self._timeseries_dedupe_key(ow_user_id, ow_type, record)
         else:
-            params = lambda start_time, end_time: {
+            params = lambda start_time, end_time, created_after: {
                 "start_date": start_time.isoformat(),
                 "end_date": end_time.isoformat(),
             }
@@ -535,82 +608,110 @@ class Command(BaseCommand):
                 dedupe_key = lambda record: self._summary_dedupe_key(ow_user_id, ow_type, record)
 
         shim_type = OW_TYPE_TO_SHIM_TYPE.get(ow_type, ow_type)
+        lookback = ow_type in LOOKBACK_TYPES
         return Fetcher(
             system=NORMALIZED_SYSTEM,
-            records=lambda start_time, end_time: self._fetch_page(
-                user, ow_api_url, ow_api_key, ow_user_id, path, params(start_time, end_time)
+            records=lambda start_time, end_time, created_after: self._fetch_page(
+                user, ow_api_url, ow_api_key, ow_user_id, path, params(start_time, end_time, created_after)
             ),
             convert=lambda record: convert(source="ow_normalized", data_type=shim_type, sample=record, tz=UTC),
             dedupe_key=dedupe_key,
             source=_label,
-            lookback=self._sleep_lookback() if ow_type in LOOKBACK_TYPES else None,
+            lookback=self._sleep_lookback() if lookback else None,
+            by_arrival=path == "timeseries" and not lookback,
         )
+
+    @staticmethod
+    def _timeseries_params(series, start_time, end_time, created_after=None):
+        params = {"types": series, "start_time": start_time.isoformat(), "end_time": end_time.isoformat()}
+        if created_after is not None:
+            params["created_after"] = created_after.isoformat()
+        return params
 
     def _total_fetcher(self, user, ow_user_id, ow_api_url, ow_api_key, ow_type):
         """Each source's daily steps or nightly sleep, totalled from the OW records they come from."""
+        fetch = lambda path, params: self._fetch_page(user, ow_api_url, ow_api_key, ow_user_id, path, params)
         if ow_type == "steps":
-            totals = lambda start_time, end_time: self._daily_steps(
-                self._fetch_page(
-                    user,
-                    ow_api_url,
-                    ow_api_key,
-                    ow_user_id,
-                    "timeseries",
-                    {"types": "steps", "start_time": start_time.isoformat(), "end_time": end_time.isoformat()},
+            steps = lambda start_time, end_time, created_after=None: fetch(
+                "timeseries", self._timeseries_params("steps", start_time, end_time, created_after)
+            )
+            return Fetcher(
+                system=NORMALIZED_SYSTEM,
+                records=lambda start_time, end_time, created_after: self._steps_to_total(
+                    steps, start_time, end_time, created_after
                 ),
-                start_time,
+                convert=lambda total: _data_point(
+                    STEP_COUNT_CODE,
+                    {
+                        "step_count": {"value": total["steps"], "unit": "steps"},
+                        "effective_time_frame": {"time_interval": total["interval"]},
+                    },
+                ),
+                dedupe_key=lambda total: f"{ow_user_id}:{ow_type}:{total['label']}:{total['day']}",
+                source=lambda total: total["label"],
+                by_arrival=True,
             )
-            convert = lambda total: _data_point(
-                STEP_COUNT_CODE,
-                {
-                    "step_count": {"value": total["steps"], "unit": "steps"},
-                    "effective_time_frame": {"time_interval": total["interval"]},
-                },
-            )
-        else:
-            totals = lambda start_time, end_time: self._nightly_sleep(
-                self._fetch_page(
-                    user,
-                    ow_api_url,
-                    ow_api_key,
-                    ow_user_id,
+
+        lead = TOTAL_LEAD[ow_type]
+        return Fetcher(
+            system=NORMALIZED_SYSTEM,
+            records=lambda start_time, end_time, created_after: self._nightly_sleep(
+                fetch(
                     "events/sleep",
-                    {"start_date": start_time.isoformat(), "end_date": end_time.isoformat()},
+                    {"start_date": (start_time - lead).isoformat(), "end_date": end_time.isoformat()},
                 ),
-                start_time,
-            )
-            convert = lambda total: _data_point(
+                start_time.astimezone(UTC).date(),
+            ),
+            convert=lambda total: _data_point(
                 TOTAL_SLEEP_TIME_CODE,
                 {
                     "total_sleep_time": {"value": total["seconds"], "unit": "sec"},
                     "effective_time_frame": {"time_interval": total["interval"]},
                 },
-            )
-        return Fetcher(
-            system=NORMALIZED_SYSTEM,
-            records=lambda start_time, end_time: totals(start_time - TOTAL_LEAD[ow_type], end_time),
-            convert=convert,
+            ),
             dedupe_key=lambda total: f"{ow_user_id}:{ow_type}:{total['label']}:{total['day']}",
             source=lambda total: total["label"],
             lookback=self._sleep_lookback(),
         )
 
+    def _steps_to_total(self, steps, start_time, end_time, created_after):
+        """The local days whose steps to total, and their totals.
+
+        Read by arrival, those are the days of the samples OW stored since
+        ``created_after``, however long ago they were taken: each is totalled again
+        from all of its samples. With no watermark, every whole day from
+        ``start_time``'s date on.
+        """
+        lead = TOTAL_LEAD["steps"]
+        if created_after is None:
+            first_day = start_time.astimezone(UTC).date()
+            return self._daily_steps(steps(start_time - lead, end_time), lambda day: day >= first_day)
+
+        days = {_local_day(sample) for sample in steps(start_time, end_time, created_after) if sample.get("timestamp")}
+        if not days:
+            return []
+        low = datetime.combine(min(days), time.min, tzinfo=UTC) - lead
+        high = min(datetime.combine(max(days), time.min, tzinfo=UTC) + lead, end_time)
+        return self._daily_steps(steps(low, high), days.__contains__)
+
     @staticmethod
-    def _daily_steps(samples, fetched_from):
-        """Each source's steps per local day.
+    def _daily_steps(samples, wanted):
+        """Each source's steps per local day, for the days ``wanted`` accepts.
 
         A day's total is the OW data source's own daily total where it reports one
         (``is_daily_total``, as Garmin does), else the sum of its samples. Two data
         sources under one label, two channels of one device, take the larger total,
         never the sum. A sample counts toward the day it was taken on in its own
-        offset, and only days wholly inside the fetch are returned (see ``TOTAL_LEAD``).
+        offset. The caller fetches every wanted day whole (see ``TOTAL_LEAD``).
         """
         per_writer = {}
         for sample in samples:
             timestamp, value = sample.get("timestamp"), sample.get("value")
             if not timestamp or value is None:
                 continue
-            day = datetime.fromisoformat(timestamp).astimezone(_zone(sample.get("zone_offset")) or UTC).date()
+            day = _local_day(sample)
+            if not wanted(day):
+                continue
             entry = per_writer.setdefault(
                 (day, _writer(sample)), {"label": _label(sample), "daily": None, "summed": 0.0, "offset": ""}
             )
@@ -620,12 +721,11 @@ class Command(BaseCommand):
                 entry["summed"] += value
             entry["offset"] = max(entry["offset"], sample.get("zone_offset") or "")
 
-        first_day = (fetched_from + TOTAL_LEAD["steps"]).astimezone(UTC).date()
         days = {}
         for (day, _writer_id), entry in per_writer.items():
             steps = round(entry["daily"] if entry["daily"] is not None else entry["summed"])
             key = (day, entry["label"])
-            if day < first_day or (key in days and days[key]["steps"] >= steps):
+            if key in days and days[key]["steps"] >= steps:
                 continue
             start = datetime.combine(day, time.min, tzinfo=_zone(entry["offset"]) or UTC)
             days[key] = {
@@ -637,15 +737,15 @@ class Command(BaseCommand):
         return days.values()
 
     @staticmethod
-    def _nightly_sleep(sessions, fetched_from):
+    def _nightly_sleep(sessions, first_night):
         """Each source's sleep per night.
 
         A night is the local day a session ends on. Its total is the time asleep of
         every session of one OW data source ending that day, naps included, over the
         span from the first bedtime to the last waking. Two data sources under one
         label take the larger total. A session of time in bed alone is no sleep. Only
-        nights whose sessions all started inside the fetch are returned (see
-        ``TOTAL_LEAD``).
+        nights from ``first_night`` on are returned; the caller fetches their
+        sessions whole (see ``TOTAL_LEAD``).
         """
         per_writer = {}
         for session in sessions:
@@ -662,7 +762,6 @@ class Command(BaseCommand):
             entry["start"] = min(entry["start"], start)
             entry["end"] = max(entry["end"], end)
 
-        first_night = (fetched_from + TOTAL_LEAD["sleep_duration"]).astimezone(UTC).date()
         nights = {}
         for (night, _writer_id), entry in per_writer.items():
             key = (night, entry["label"])
@@ -686,7 +785,7 @@ class Command(BaseCommand):
             return None
         return Fetcher(
             system=RAW_SYSTEM,
-            records=lambda start_time, end_time: self._fetch_raw_objects(user, ow_user_id, start_time),
+            records=lambda start_time, end_time, created_after: self._fetch_raw_objects(user, ow_user_id, start_time),
             convert=lambda record: convert(source="oura_raw", data_type=ow_type, sample=record, tz=UTC),
             dedupe_key=lambda record: self._timeseries_dedupe_key(ow_user_id, ow_type, record),
             source=lambda record: "Oura",
@@ -710,29 +809,52 @@ class Command(BaseCommand):
                 continue
             yield from payload.get("data", [])
 
-    def _poll_user(self, user, patient, ow_type, code, fetcher, poll_window):
-        """Ingest one data type for one patient from one source."""
+    def _poll_user(self, user, patient, ow_type, code, fetcher, run):
+        """Ingest one data type for one patient from one source.
+
+        Read by arrival, a first poll, or one given ``--days``, reads the poll window by
+        when samples were recorded; later ones read what OW stored since the last
+        complete read. Only a complete read moves the watermark.
+        """
         end_time = timezone.now()
-        if fetcher.lookback is None:
-            start_time = self._resume_start_time(patient, code, fetcher.system, end_time - poll_window)
+        created_after = None
+        if fetcher.by_arrival:
+            watermark = (
+                None if run.backfill else OwPollWatermark.objects.filter(patient=patient, ow_type=ow_type).first()
+            )
+            if watermark is None:
+                start_time = end_time - run.poll_window
+            else:
+                start_time, created_after = ARRIVAL_WINDOW_START, watermark.read_until - ARRIVAL_OVERLAP
+        elif fetcher.lookback is None:
+            start_time = self._resume_start_time(patient, code, fetcher.system, end_time - run.poll_window)
         else:
-            start_time = end_time - max(fetcher.lookback, poll_window)
+            start_time = end_time - max(fetcher.lookback, run.poll_window)
 
         created = 0
-        for record in fetcher.records(start_time, end_time):
-            try:
-                omh_record = fetcher.convert(record)
-            except Exception:
-                logger.warning("Skipping unconvertible record for user=%s type=%s", user.id, ow_type, exc_info=True)
-                continue
+        try:
+            for record in fetcher.records(start_time, end_time, created_after):
+                try:
+                    omh_record = fetcher.convert(record)
+                except Exception:
+                    logger.warning("Skipping unconvertible record for user=%s type=%s", user.id, ow_type, exc_info=True)
+                    continue
 
-            identifier = fetcher.dedupe_key(record)
-            if not identifier:
-                continue
+                identifier = fetcher.dedupe_key(record)
+                if not identifier:
+                    continue
 
-            data_source = self._data_source(fetcher.source(record))
-            if self._save_observation(patient, code, data_source, omh_record, fetcher.system, identifier):
-                created += 1
+                data_source = self._data_source(fetcher.source(record))
+                if self._save_observation(patient, code, data_source, omh_record, fetcher.system, identifier):
+                    created += 1
+        except IncompleteFetch:
+            logger.warning("Incomplete OW read for user=%s type=%s, read again next poll", user.id, ow_type)
+            return created
+
+        if fetcher.by_arrival:
+            OwPollWatermark.objects.update_or_create(
+                patient=patient, ow_type=ow_type, defaults={"read_until": end_time}
+            )
 
         logger.info("Poll completed for jhe_user=%s patient=%s created=%d", user.id, patient.id, created)
         return created

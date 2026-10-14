@@ -17,6 +17,7 @@ from core.models import (
     Observation,
     ObservationIdentifier,
     Organization,
+    OwPollWatermark,
     Patient,
     PatientIdentifier,
     PatientInvitation,
@@ -257,6 +258,13 @@ class ObservationIdentifierAdmin(admin.ModelAdmin):
     list_display = ("id", "observation", "system", "value")
     search_fields = ("system", "value")
     raw_id_fields = ("observation",)
+
+
+@admin.register(OwPollWatermark)
+class OwPollWatermarkAdmin(admin.ModelAdmin):
+    list_display = ("id", "patient", "ow_type", "read_until")
+    search_fields = ("ow_type", "patient__name_family", "patient__name_given")
+    raw_id_fields = ("patient",)
 
 
 @admin.register(PractitionerOrganization)
