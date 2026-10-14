@@ -94,49 +94,17 @@ def _fake_omh_record(uuid_value="rec-1"):
 
 
 def _serve_heart_rate_only(mock_get):
-    """Serve the mocked OW page to the heart_rate request and an empty page to every other series.
-
-    A heart-rate-consented patient is also polled for resting_heart_rate, which shares the code.
-    """
+    """Serve the mocked OW page to the heart_rate request and an empty page to every other series."""
     page = mock_get.return_value
     empty = MagicMock(status_code=200)
     empty.json.return_value = {"data": [], "pagination": {"has_more": False}}
     mock_get.side_effect = lambda url, **kwargs: page if kwargs["params"]["types"] == "heart_rate" else empty
 
 
-def _physical_activity_data_point(day):
-    """A schema-valid ieee:physical-activity:1.0 data point for one whole day.
-
-    Built by hand for the same reason as seed.sleep_episode_data_point: the schema
-    requires activity_name and an effective_time_frame restricted to a time_interval,
-    which generate_observation_value_attachment_data does not produce.
-    """
-    return {
-        "header": {
-            "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "schema_id": {"namespace": "ieee", "name": "physical-activity", "version": "1.0"},
-            "source_creation_date_time": f"{day}T23:59:59Z",
-            "modality": "sensed",
-            "acquisition_provenance": {"source_name": "Oura"},
-        },
-        "body": {
-            "activity_name": "Total Daily Physical Activity",
-            "effective_time_frame": {
-                "time_interval": {
-                    "start_date_time": f"{day}T00:00:00Z",
-                    "end_date_time": f"{day}T23:59:59Z",
-                }
-            },
-            "base_movement_quantity": {"value": 8000, "unit": "steps"},
-            "kcal_burned": {"value": 400, "unit": "kcal"},
-        },
-    }
-
-
 def _sleep_stage_summary_data_point(start, end):
     """A schema-valid ieee:sleep-stage-summary:1.0 data point for one night.
 
-    Built by hand for the same reason as _physical_activity_data_point: the schema
+    Built by hand for the same reason as seed.sleep_episode_data_point: the schema
     requires a sleep_stage_summary holding a total_sleep_time, and an
     effective_time_frame restricted to a time_interval.
     """
@@ -804,7 +772,7 @@ def test_convert_is_called_with_a_timezone(db, ow_user, patient_with_consent, hr
 
 
 def _requested_start(mock_get):
-    """The start_time of the last heart_rate request; resting_heart_rate is requested after it."""
+    """The start_time of the last heart_rate request."""
     from datetime import datetime
 
     heart_rate = [c for c in mock_get.call_args_list if c.kwargs["params"].get("types") == "heart_rate"]
@@ -1003,33 +971,28 @@ def test_one_sleep_session_fans_out_to_every_sleep_code(db, ow_user, patient_wit
     ).exists()
 
 
-def test_activity_summaries_are_fetched_from_the_summaries_route(db, ow_user, patient_with_consent, organization):
-    """Physical activity comes from /summaries/activity, keyed on the day it summarises."""
+def test_daily_summaries_are_not_read(db, ow_user, patient_with_consent, organization):
+    """OW's daily summaries keep one source per day, so steps and sleep are totalled from their records."""
     from .utils import add_patient_to_study, create_study
 
     _set_jhe_setting("module.ow", True)
     _clear_sync_lock()
 
-    activity_study = create_study(
-        name="activity study", organization=organization, codes=["ieee:physical-activity:1.0"]
+    study = create_study(
+        name="activity study",
+        organization=organization,
+        codes=["ieee:physical-activity:1.0", "omh:step-count:3.0", "ieee:total-sleep-time:1.0"],
     )
-    add_patient_to_study(patient=patient_with_consent, study=activity_study)
+    add_patient_to_study(patient=patient_with_consent, study=study)
 
-    summary = {"date": "2026-09-20", "source": {"provider": "oura"}, "steps": 8000, "active_energy_kcal": 400}
-
-    with (
-        patch("core.management.commands.ow_poll.requests.get") as mock_get,
-        patch("core.management.commands.ow_poll.convert") as mock_convert,
-    ):
+    with patch("core.management.commands.ow_poll.requests.get") as mock_get:
         mock_get.return_value.status_code = 200
-        mock_get.return_value.json.return_value = {"data": [summary], "pagination": {"has_more": False}}
-        mock_convert.return_value = _physical_activity_data_point("2026-09-20")
-
+        mock_get.return_value.json.return_value = {"data": [], "pagination": {"has_more": False}}
         call_command("ow_poll", stdout=StringIO())
 
     requested_urls = [call.args[0] for call in mock_get.call_args_list]
-    assert any(url.endswith("/summaries/activity") for url in requested_urls), requested_urls
-    assert ObservationIdentifier.objects.filter(value="user-123:physical_activity:2026-09-20").exists()
+    assert any(url.endswith("/events/workouts") for url in requested_urls), requested_urls
+    assert not [url for url in requested_urls if "/summaries/" in url]
 
 
 def test_workouts_are_fetched_from_the_events_route(db, ow_user, patient_with_consent, organization):
@@ -1066,7 +1029,10 @@ def test_workouts_are_fetched_from_the_events_route(db, ow_user, patient_with_co
 
 
 def test_seed_gives_oura_every_supported_scope(seeded):
-    """The Oura data source must offer every code ow_poll can fill."""
+    """The Oura data source must offer every code ow_poll can fill that Oura measures.
+
+    Glucose and body temperature reach OW from phones, not from Oura.
+    """
     from core.management.commands.ow_poll import OW_TYPE_TO_CODE
     from core.models import DataSource, DataSourceSupportedScope
 
@@ -1074,7 +1040,7 @@ def test_seed_gives_oura_every_supported_scope(seeded):
     scopes = set(
         DataSourceSupportedScope.objects.filter(data_source=oura).values_list("scope_code__coding_code", flat=True)
     )
-    expected = set(OW_TYPE_TO_CODE.values()) - {"omh:blood-glucose:4.0"}
+    expected = set(OW_TYPE_TO_CODE.values()) - {"omh:blood-glucose:4.0", "omh:body-temperature:4.0"}
     assert expected <= scopes, f"missing from the Oura data source: {sorted(expected - scopes)}"
 
 
@@ -1084,12 +1050,13 @@ def test_every_polled_timeseries_type_is_a_real_ow_series():
 
     ow_series_names = {
         "heart_rate",
-        "resting_heart_rate",
         "blood_glucose",
         "oxygen_saturation",
         "respiratory_rate",
+        "body_temperature",
         "weight",
         "height",
+        "steps",
     }
     timeseries_types = [t for t in OW_TYPE_TO_CODE if t not in OW_TYPE_TO_ROUTE]
     requested = {OW_TYPE_TO_SERIES.get(t, t) for t in timeseries_types}
@@ -1111,8 +1078,8 @@ def test_sleep_routes_look_back_past_the_watermark(db):
         "sleep_stage_summary",
         "time_in_bed",
         "sleep_duration",
+        "steps",
         "workout",
-        "resting_heart_rate",
         "respiratory_rate",
     }
 
@@ -1145,27 +1112,19 @@ def test_resting_heart_rate_does_not_collide_with_heart_rate(db):
     assert plain != resting
 
 
-def test_resting_heart_rate_is_polled_under_the_heart_rate_code(db, ow_user, patient_with_consent, hr_concept):
-    """OW serves Oura's resting heart rate as its own series, filed under heart rate and tagged as during sleep."""
+def test_resting_heart_rate_is_not_polled(db, ow_user, patient_with_consent, hr_concept):
+    """OMH has no resting heart rate schema, and filed under heart rate it could not be told apart."""
     _set_jhe_setting("module.ow", True)
     _clear_sync_lock()
 
-    resting = {"timestamp": "2026-09-19T23:30:00+00:00", "type": "resting_heart_rate", "value": 48, "unit": "bpm"}
-
-    def _get(url, **kwargs):
-        response = MagicMock(status_code=200)
-        data = [resting] if kwargs["params"].get("types") == "resting_heart_rate" else []
-        response.json.return_value = {"data": data, "pagination": {"has_more": False}}
-        return response
-
-    with patch("core.management.commands.ow_poll.requests.get", side_effect=_get):
+    with patch("core.management.commands.ow_poll.requests.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"data": [], "pagination": {"has_more": False}}
         call_command("ow_poll", stdout=StringIO())
 
-    obs = Observation.objects.get(subject_patient=patient_with_consent, codeable_concept=hr_concept)
-    assert obs.omh_data["body"]["temporal_relationship_to_sleep"] == "during sleep"
-    assert ObservationIdentifier.objects.filter(
-        observation=obs, value="user-123:resting_heart_rate:2026-09-19T23:30:00+00:00"
-    ).exists()
+    requested_types = [call.kwargs["params"].get("types") for call in mock_get.call_args_list]
+    assert "heart_rate" in requested_types
+    assert "resting_heart_rate" not in requested_types
 
 
 def test_unconvertible_record_warning_names_the_type(db, ow_user, patient_with_consent, hr_concept, caplog):
@@ -1184,7 +1143,7 @@ def test_unconvertible_record_warning_names_the_type(db, ow_user, patient_with_c
         call_command("ow_poll", stdout=StringIO())
 
     assert "Skipping unconvertible record for user=" in caplog.text
-    assert "type=resting_heart_rate" in caplog.text
+    assert "type=heart_rate" in caplog.text
 
 
 def test_polls_only_the_oldest_ow_link(db, ow_user, patient_with_consent, hr_concept):

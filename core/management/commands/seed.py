@@ -338,6 +338,7 @@ class Command(BaseCommand):
                     "omh:respiratory-rate:2.0",
                     "omh:body-weight:3.0",
                     "omh:body-height:2.0",
+                    "omh:step-count:3.0",
                     "ieee:sleep-episode:1.0",
                     "ieee:sleep-stage-summary:1.0",
                     "ieee:time-in-bed:1.0",

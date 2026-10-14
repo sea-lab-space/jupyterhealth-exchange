@@ -39,9 +39,24 @@ from it is served by ``timeseries``. The three sleep event types each fetch
 ``events/sleep`` independently, which keeps one data type mapping to one code.
 
 ``OW_TYPE_TO_SHIM_TYPE`` covers the keys that are not omh-shim data types:
-``workout`` converts as ``physical_activity`` and files under the same code as the
-daily activity summary, and ``resting_heart_rate`` converts as ``heart_rate``. Each
-needs its own key for its own OW request and dedupe key.
+``workout`` converts as ``physical_activity``. It needs its own key for its own OW
+request and dedupe key.
+
+Resting heart rate is not polled. OW serves it as its own series, but OMH has no
+schema for it: filed under heart rate, it could not be told from the heart rate
+measured at that instant.
+
+Every reading is filed under the DataSource named after the device or app that
+recorded it (``core.services.data_sources``): "Apple Watch", "Garmin", "Google Health
+via Apple Health". A device or app writing through OW is one OW data source, so the
+timeseries dedupe key names it too, and two of them measuring at the same instant
+are both kept.
+
+``TOTAL_TYPES`` are built here rather than converted, because each is a total over
+many OW records rather than one of them: ``steps`` is one ``omh:step-count:3.0``
+reading per source and local day, from the step samples, and ``sleep_duration`` one
+``ieee:total-sleep-time:1.0`` reading per source and night, from the sleep sessions.
+OW's own daily summaries keep a single source per day, so they are not read.
 
 ``OW_TYPE_TO_SERIES`` exists because most keys of ``OW_TYPE_TO_CODE`` are omh-shim
 data types, not OW series names, and the two namespaces are not the same. They
@@ -60,12 +75,16 @@ it when patients link with device history already recorded, or pass ``--days``
 for a one-off backfill.
 
 ``ow.sleep_lookback_days`` (default 7) sets how far back the ``LOOKBACK_TYPES``
-are refetched on every poll. See ``Fetcher.lookback``.
+are refetched on every poll, the daily step totals among them. See ``Fetcher.lookback``.
 """
 
+import hashlib
 import logging
+import re
+import uuid
 from collections import namedtuple
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
+from datetime import timezone as fixed_offset
 
 import requests
 from django.core.cache import cache
@@ -84,6 +103,7 @@ from core.models import (
     Observation,
     ObservationIdentifier,
 )
+from core.services.data_sources import source_label
 from core.services.jhe_settings import get_setting
 from core.services.ow_ingest import list_new_objects, read_object
 
@@ -96,20 +116,22 @@ PAGE_LIMIT = 100
 MAX_PAGES = 200
 HEART_RATE_CODE = "omh:heart-rate:2.0"
 BLOOD_GLUCOSE_CODE = "omh:blood-glucose:4.0"
+STEP_COUNT_CODE = "omh:step-count:3.0"
+TOTAL_SLEEP_TIME_CODE = "ieee:total-sleep-time:1.0"
 
 OW_TYPE_TO_CODE = {
     "heart_rate": HEART_RATE_CODE,
-    "resting_heart_rate": HEART_RATE_CODE,
     "blood_glucose": BLOOD_GLUCOSE_CODE,
     "oxygen_saturation": "omh:oxygen-saturation:2.0",
     "respiratory_rate": "omh:respiratory-rate:2.0",
+    "body_temperature": "omh:body-temperature:4.0",
     "body_weight": "omh:body-weight:3.0",
     "body_height": "omh:body-height:2.0",
+    "steps": STEP_COUNT_CODE,
     "sleep_episode": "ieee:sleep-episode:1.0",
     "sleep_stage_summary": "ieee:sleep-stage-summary:1.0",
     "time_in_bed": "ieee:time-in-bed:1.0",
-    "sleep_duration": "ieee:total-sleep-time:1.0",
-    "physical_activity": "ieee:physical-activity:1.0",
+    "sleep_duration": TOTAL_SLEEP_TIME_CODE,
     "workout": "ieee:physical-activity:1.0",
 }
 
@@ -117,8 +139,7 @@ OW_TYPE_TO_ROUTE = {
     "sleep_episode": "events/sleep",
     "sleep_stage_summary": "events/sleep",
     "time_in_bed": "events/sleep",
-    "sleep_duration": "summaries/sleep",
-    "physical_activity": "summaries/activity",
+    "sleep_duration": "events/sleep",
     "workout": "events/workouts",
 }
 OW_TYPE_TO_SERIES = {
@@ -127,15 +148,19 @@ OW_TYPE_TO_SERIES = {
 }
 OW_TYPE_TO_SHIM_TYPE = {
     "workout": "physical_activity",
-    "resting_heart_rate": "heart_rate",
 }
+TOTAL_TYPES = {"steps", "sleep_duration"}
+# How much earlier than its window a total is fetched, so that every local day or night
+# it returns from the window's first UTC date on is whole. A local day starts up to 14
+# hours before the UTC one, and a night's sessions start up to a day before it ends.
+TOTAL_LEAD = {"steps": timedelta(days=2), "sleep_duration": timedelta(days=3)}
 LOOKBACK_TYPES = {
     "sleep_episode",
     "sleep_stage_summary",
     "time_in_bed",
     "sleep_duration",
+    "steps",
     "workout",
-    "resting_heart_rate",
     "respiratory_rate",
 }
 NORMALIZED_SYSTEM = "ow:normalized"
@@ -148,27 +173,84 @@ _SYNC_LOCK_KEY = "ow.sync_in_progress"
 # interval (15 min) so a healthy long-running poll is never preempted.
 LOCK_STALE_AFTER = timedelta(minutes=30)
 
-Fetcher = namedtuple("Fetcher", "system shim_source records dedupe_key lookback", defaults=(None,))
+Fetcher = namedtuple("Fetcher", "system records convert dedupe_key source lookback", defaults=(None,))
 """One source of samples.
 
 ``system`` is the ObservationIdentifier system its rows are filed under,
-``shim_source`` the omh-shim source name, ``records`` a callable taking
-(start_time, end_time) and yielding raw sample dicts, and ``dedupe_key`` a
-callable taking one record and returning the string that identifies it, or
-None when the record cannot be identified and must be skipped.
+``records`` a callable taking (start_time, end_time) and yielding raw sample
+dicts, ``convert`` a callable turning one record into the OMH data point stored,
+``dedupe_key`` a callable taking one record and returning the string that
+identifies it, or None when the record cannot be identified and must be skipped,
+and ``source`` a callable naming the DataSource one record is filed under.
 
 ``lookback`` replaces the resume watermark with a fixed window when a source
 revises records after first publishing them. Oura can update a sleep record
 after it is first created, and the watermark would already have advanced past
 it, so it would never be fetched again and the upsert would never fire.
-Workouts use it too: they sync as late as sleep, and they share a code with the
-daily activity summary, whose rows would push the watermark past a late workout.
-Resting heart rate does for the same reason: OW stamps it at the start of the
-night's sleep, hours behind the heart rate rows that share its code.
+Workouts use it too: they sync as late as sleep.
+A day's steps and a night's sleep do because each is rebuilt from its records,
+and grows as they arrive.
 Respiratory rate does because OW files it once per night at the start of sleep
 and rewrites that sample in place when Oura revises the night.
 A source that only ever appends leaves this None and resumes from the watermark.
 """
+
+_ZONE_OFFSET = re.compile(r"([+-])(\d{2}):(\d{2})")
+
+
+def _zone(offset):
+    """An OW ``zone_offset`` ("-04:00") as a tzinfo, or None when it names none."""
+    match = _ZONE_OFFSET.fullmatch(offset or "")
+    if not match or int(match[2]) >= 24:
+        return None
+    sign = -1 if match[1] == "-" else 1
+    return fixed_offset(sign * timedelta(hours=int(match[2]), minutes=int(match[3])))
+
+
+def _iso(moment):
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def _writer(record):
+    """Identify the OW data source that wrote a record, without naming it.
+
+    OW keeps one data source per user, provider, device model and source name, and one
+    sample per data source, series and instant. The names are hashed because HealthKit
+    names a person's devices after them ("Jan's Apple Watch") and dedupe keys are not
+    meant to carry that.
+    """
+    source = record.get("source")
+    if not isinstance(source, dict):
+        return ""
+    parts = (source.get("provider"), source.get("device"), source.get("source"))
+    return hashlib.sha256("|".join(str(part or "") for part in parts).encode()).hexdigest()[:16]
+
+
+def _label(record):
+    """The DataSource name for an OW record, from the source metadata OW puts on it."""
+    source = record.get("source")
+    if not isinstance(source, dict):
+        return source_label()
+    return source_label(
+        provider=source.get("provider"),
+        source_name=source.get("source"),
+        device_model=source.get("device"),
+        device_type=source.get("device_type"),
+    )
+
+
+def _data_point(schema_id, body):
+    """An IEEE 1752.1 data point around a body built here, with the header omh-shim gives."""
+    namespace, name, version = schema_id.split(":")
+    return {
+        "header": {
+            "uuid": str(uuid.uuid4()),
+            "schema_id": {"namespace": namespace, "name": name, "version": version},
+            "source_creation_date_time": _iso(datetime.now(UTC)),
+            "modality": "sensed",
+        },
+        "body": body,
+    }
 
 
 def _write_sync_lock(value: str) -> None:
@@ -299,7 +381,7 @@ class Command(BaseCommand):
         if not codes:
             return
 
-        oura_ds, _ = DataSource.objects.get_or_create(name="Oura", defaults={"type": "personal_device"})
+        self._data_sources = {}
         poll_window = self._poll_window(options)
 
         users = JheUser.objects.filter(patient_profile__identifiers__system=OW_USER_ID_SYSTEM).distinct()
@@ -326,7 +408,7 @@ class Command(BaseCommand):
                         fetcher = self._raw_fetcher(user, ow_user_id, ow_type)
                     if fetcher is None:
                         continue
-                    total_created += self._poll_user(user, patient, ow_type, code, oura_ds, fetcher, poll_window)
+                    total_created += self._poll_user(user, patient, ow_type, code, fetcher, poll_window)
                 except Exception:
                     logger.exception("ow_poll failed for jhe_user_id=%s type=%s", user.id, ow_type)
 
@@ -385,22 +467,23 @@ class Command(BaseCommand):
     def _timeseries_dedupe_key(self, ow_user_id, ow_type, record):
         """Identify one timeseries sample.
 
-        OW timeseries samples carry no id of their own, so the natural key is the
-        patient, the series and the instant. The OW user id is part of the key
-        because ObservationIdentifier is unique on (system, value) globally, not
-        per patient, so two patients reporting the same value at the same instant
-        would otherwise collide and the second row would be dropped.
+        OW timeseries samples carry no id of their own, but OW keeps one sample per
+        data source, series and instant, so those and the patient are the natural
+        key. The OW user id is part of the key because ObservationIdentifier is
+        unique on (system, value) globally, not per patient, so two patients
+        reporting the same value at the same instant would otherwise collide and the
+        second row would be dropped. The data source is, so a watch and a phone
+        measuring at the same instant are both kept. Raw samples name none.
 
         The series comes off the sample rather than from the data type, because
-        several OW series can share one data type: ``resting_heart_rate`` and
-        ``heart_rate`` both convert as ``heart_rate`` and both file under
-        ``omh:heart-rate:2.0``, so keying on the data type would collide them.
+        the two namespaces differ (see ``OW_TYPE_TO_SERIES``).
         """
         timestamp = record.get("timestamp")
         if not timestamp:
             return None
         series = record.get("type") or OW_TYPE_TO_SERIES.get(ow_type, ow_type)
-        return f"{ow_user_id}:{series}:{timestamp}"
+        writer = _writer(record)
+        return f"{ow_user_id}:{series}:{writer}:{timestamp}" if writer else f"{ow_user_id}:{series}:{timestamp}"
 
     def _event_dedupe_key(self, ow_user_id, ow_type, record):
         """Identify one OW event record.
@@ -430,6 +513,8 @@ class Command(BaseCommand):
 
     def _normalized_fetcher(self, user, ow_user_id, ow_api_url, ow_api_key, ow_type):
         """Samples from whichever OW route serves this data type."""
+        if ow_type in TOTAL_TYPES:
+            return self._total_fetcher(user, ow_user_id, ow_api_url, ow_api_key, ow_type)
         path = OW_TYPE_TO_ROUTE.get(ow_type, "timeseries")
         if path == "timeseries":
             series = OW_TYPE_TO_SERIES.get(ow_type, ow_type)
@@ -449,15 +534,147 @@ class Command(BaseCommand):
             else:
                 dedupe_key = lambda record: self._summary_dedupe_key(ow_user_id, ow_type, record)
 
+        shim_type = OW_TYPE_TO_SHIM_TYPE.get(ow_type, ow_type)
         return Fetcher(
             system=NORMALIZED_SYSTEM,
-            shim_source="ow_normalized",
             records=lambda start_time, end_time: self._fetch_page(
                 user, ow_api_url, ow_api_key, ow_user_id, path, params(start_time, end_time)
             ),
+            convert=lambda record: convert(source="ow_normalized", data_type=shim_type, sample=record, tz=UTC),
             dedupe_key=dedupe_key,
+            source=_label,
             lookback=self._sleep_lookback() if ow_type in LOOKBACK_TYPES else None,
         )
+
+    def _total_fetcher(self, user, ow_user_id, ow_api_url, ow_api_key, ow_type):
+        """Each source's daily steps or nightly sleep, totalled from the OW records they come from."""
+        if ow_type == "steps":
+            totals = lambda start_time, end_time: self._daily_steps(
+                self._fetch_page(
+                    user,
+                    ow_api_url,
+                    ow_api_key,
+                    ow_user_id,
+                    "timeseries",
+                    {"types": "steps", "start_time": start_time.isoformat(), "end_time": end_time.isoformat()},
+                ),
+                start_time,
+            )
+            convert = lambda total: _data_point(
+                STEP_COUNT_CODE,
+                {
+                    "step_count": {"value": total["steps"], "unit": "steps"},
+                    "effective_time_frame": {"time_interval": total["interval"]},
+                },
+            )
+        else:
+            totals = lambda start_time, end_time: self._nightly_sleep(
+                self._fetch_page(
+                    user,
+                    ow_api_url,
+                    ow_api_key,
+                    ow_user_id,
+                    "events/sleep",
+                    {"start_date": start_time.isoformat(), "end_date": end_time.isoformat()},
+                ),
+                start_time,
+            )
+            convert = lambda total: _data_point(
+                TOTAL_SLEEP_TIME_CODE,
+                {
+                    "total_sleep_time": {"value": total["seconds"], "unit": "sec"},
+                    "effective_time_frame": {"time_interval": total["interval"]},
+                },
+            )
+        return Fetcher(
+            system=NORMALIZED_SYSTEM,
+            records=lambda start_time, end_time: totals(start_time - TOTAL_LEAD[ow_type], end_time),
+            convert=convert,
+            dedupe_key=lambda total: f"{ow_user_id}:{ow_type}:{total['label']}:{total['day']}",
+            source=lambda total: total["label"],
+            lookback=self._sleep_lookback(),
+        )
+
+    @staticmethod
+    def _daily_steps(samples, fetched_from):
+        """Each source's steps per local day.
+
+        A day's total is the OW data source's own daily total where it reports one
+        (``is_daily_total``, as Garmin does), else the sum of its samples. Two data
+        sources under one label, two channels of one device, take the larger total,
+        never the sum. A sample counts toward the day it was taken on in its own
+        offset, and only days wholly inside the fetch are returned (see ``TOTAL_LEAD``).
+        """
+        per_writer = {}
+        for sample in samples:
+            timestamp, value = sample.get("timestamp"), sample.get("value")
+            if not timestamp or value is None:
+                continue
+            day = datetime.fromisoformat(timestamp).astimezone(_zone(sample.get("zone_offset")) or UTC).date()
+            entry = per_writer.setdefault(
+                (day, _writer(sample)), {"label": _label(sample), "daily": None, "summed": 0.0, "offset": ""}
+            )
+            if sample.get("is_daily_total"):
+                entry["daily"] = value if entry["daily"] is None else max(entry["daily"], value)
+            else:
+                entry["summed"] += value
+            entry["offset"] = max(entry["offset"], sample.get("zone_offset") or "")
+
+        first_day = (fetched_from + TOTAL_LEAD["steps"]).astimezone(UTC).date()
+        days = {}
+        for (day, _writer_id), entry in per_writer.items():
+            steps = round(entry["daily"] if entry["daily"] is not None else entry["summed"])
+            key = (day, entry["label"])
+            if day < first_day or (key in days and days[key]["steps"] >= steps):
+                continue
+            start = datetime.combine(day, time.min, tzinfo=_zone(entry["offset"]) or UTC)
+            days[key] = {
+                "day": day.isoformat(),
+                "label": entry["label"],
+                "steps": steps,
+                "interval": {"start_date_time": _iso(start), "end_date_time": _iso(start + timedelta(days=1))},
+            }
+        return days.values()
+
+    @staticmethod
+    def _nightly_sleep(sessions, fetched_from):
+        """Each source's sleep per night.
+
+        A night is the local day a session ends on. Its total is the time asleep of
+        every session of one OW data source ending that day, naps included, over the
+        span from the first bedtime to the last waking. Two data sources under one
+        label take the larger total. A session of time in bed alone is no sleep. Only
+        nights whose sessions all started inside the fetch are returned (see
+        ``TOTAL_LEAD``).
+        """
+        per_writer = {}
+        for session in sessions:
+            seconds = session.get("sleep_duration_seconds")
+            if not seconds or seconds <= 0 or not session.get("start_time") or not session.get("end_time"):
+                continue
+            zone = _zone(session.get("zone_offset")) or UTC
+            start = datetime.fromisoformat(session["start_time"]).astimezone(zone)
+            end = datetime.fromisoformat(session["end_time"]).astimezone(zone)
+            entry = per_writer.setdefault(
+                (end.date(), _writer(session)), {"label": _label(session), "seconds": 0, "start": start, "end": end}
+            )
+            entry["seconds"] += seconds
+            entry["start"] = min(entry["start"], start)
+            entry["end"] = max(entry["end"], end)
+
+        first_night = (fetched_from + TOTAL_LEAD["sleep_duration"]).astimezone(UTC).date()
+        nights = {}
+        for (night, _writer_id), entry in per_writer.items():
+            key = (night, entry["label"])
+            if night < first_night or (key in nights and nights[key]["seconds"] >= entry["seconds"]):
+                continue
+            nights[key] = {
+                "day": night.isoformat(),
+                "label": entry["label"],
+                "seconds": int(entry["seconds"]),
+                "interval": {"start_date_time": _iso(entry["start"]), "end_date_time": _iso(entry["end"])},
+            }
+        return nights.values()
 
     def _raw_fetcher(self, user, ow_user_id, ow_type):
         """Samples from Oura payloads OW archived to its bucket.
@@ -469,9 +686,10 @@ class Command(BaseCommand):
             return None
         return Fetcher(
             system=RAW_SYSTEM,
-            shim_source="oura_raw",
             records=lambda start_time, end_time: self._fetch_raw_objects(user, ow_user_id, start_time),
+            convert=lambda record: convert(source="oura_raw", data_type=ow_type, sample=record, tz=UTC),
             dedupe_key=lambda record: self._timeseries_dedupe_key(ow_user_id, ow_type, record),
+            source=lambda record: "Oura",
         )
 
     def _fetch_raw_objects(self, user, ow_user_id, start_time):
@@ -492,7 +710,7 @@ class Command(BaseCommand):
                 continue
             yield from payload.get("data", [])
 
-    def _poll_user(self, user, patient, ow_type, code, data_source, fetcher, poll_window):
+    def _poll_user(self, user, patient, ow_type, code, fetcher, poll_window):
         """Ingest one data type for one patient from one source."""
         end_time = timezone.now()
         if fetcher.lookback is None:
@@ -503,8 +721,7 @@ class Command(BaseCommand):
         created = 0
         for record in fetcher.records(start_time, end_time):
             try:
-                shim_type = OW_TYPE_TO_SHIM_TYPE.get(ow_type, ow_type)
-                omh_record = convert(source=fetcher.shim_source, data_type=shim_type, sample=record, tz=UTC)
+                omh_record = fetcher.convert(record)
             except Exception:
                 logger.warning("Skipping unconvertible record for user=%s type=%s", user.id, ow_type, exc_info=True)
                 continue
@@ -513,11 +730,20 @@ class Command(BaseCommand):
             if not identifier:
                 continue
 
+            data_source = self._data_source(fetcher.source(record))
             if self._save_observation(patient, code, data_source, omh_record, fetcher.system, identifier):
                 created += 1
 
         logger.info("Poll completed for jhe_user=%s patient=%s created=%d", user.id, patient.id, created)
         return created
+
+    def _data_source(self, name):
+        """The DataSource named ``name``, created the first time a reading names it."""
+        if name not in self._data_sources:
+            self._data_sources[name] = DataSource.objects.filter(name=name).order_by(
+                "id"
+            ).first() or DataSource.objects.create(name=name, type="personal_device")
+        return self._data_sources[name]
 
     def _resume_start_time(self, patient, code, system, window_start):
         """Return the time this poll should ask OW from.
