@@ -26,6 +26,7 @@ dependencies = [
     "jsonschema",
     "ipython",
     "boto3",
+    # From our fork (sea-lab-space/omh-shim): Open Wearables offsets and body temperature
     "omh-shim==2.1.0",
 ]
 
@@ -43,6 +44,9 @@ dev = [
 [tool.uv]
 # This is a Django application, not an installable package.
 package = false
+
+[tool.uv.sources]
+omh-shim = { git = "https://github.com/sea-lab-space/omh-shim.git", tag = "seacollect-2026-10-15" }
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "jhe.test_settings"
