@@ -120,6 +120,11 @@ urlpatterns = [
     ),
     # OW API proxy endpoints
     path("api/v1/ow/users", ow.create_ow_user, name="ow-create-user"),
+    path("api/v1/ow/users/me", ow.delete_ow_user, name="ow-delete-user"),
+    path("api/v1/ow/users/me/stop", ow.stop_ow_collecting, name="ow-stop-collecting"),
+    path("api/v1/ow/pairings/revoke", ow.revoke_ow_pairings, name="ow-revoke-pairings"),
+    path("api/v1/ow/sources", ow.list_ow_sources, name="ow-sources"),
+    path("api/v1/ow/sources/<str:provider>", ow.remove_ow_source, name="ow-remove-source"),
     path("api/v1/ow/oauth/oura/authorize", ow.get_oura_auth_url, name="ow-oura-authorize"),
     path("api/v1/oauth/oura/callback", ow.oura_oauth_callback, name="ow-oura-callback"),
     path("api/v1/ow/sync", ow.sync_ow_data, name="ow-sync"),

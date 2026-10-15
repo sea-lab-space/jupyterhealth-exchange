@@ -156,3 +156,20 @@ def source_label(*, provider=None, source_name=None, device_model=None, device_t
             return name[:MAX_LABEL_LENGTH]
 
     return PLATFORM_LABELS.get(provider, "Unknown source")
+
+
+def provider_of(label):
+    """The provider a label's readings come in through: a cloud account, or a phone platform.
+
+    Labels are per path, so a live connection and an export of it (an Apple Health export, a
+    Garmin account export) share their labels and map to the same provider. A label naming no
+    cloud account and no platform is Apple's hardware ("Apple Watch"), Apple's "Bluetooth
+    device", or an app that named itself; those arrive through Apple Health.
+    """
+    for provider, name in PROVIDER_LABELS.items():
+        if label == name:
+            return provider
+    for provider, name in PLATFORM_LABELS.items():
+        if label == name or label.endswith(f" via {name}"):
+            return provider
+    return "apple"

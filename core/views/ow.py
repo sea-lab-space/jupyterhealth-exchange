@@ -4,6 +4,7 @@ import logging
 import boto3
 import requests
 from django.conf import settings
+from django.db import connection, transaction
 from django.http import HttpResponseRedirect
 
 
@@ -17,6 +18,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from core.models import OW_USER_ID_SYSTEM, CodeableConcept, DataSource, Observation, PatientIdentifier
+from core.services.data_sources import PLATFORM_LABELS, PROVIDER_LABELS, provider_of
 from core.services.jhe_settings import get_setting
 
 logger = logging.getLogger(__name__)
@@ -117,6 +119,187 @@ def create_ow_user(request):
 
     tokens = _sdk_token(ow_api_url, ow_user_id) if include_tokens else {}
     return Response({"ow_user_id": ow_user_id, **tokens})
+
+
+class _OwFailed(Exception):
+    """OW is not configured, or did not do what was asked: the answer to give instead."""
+
+    def __init__(self, status, error):
+        super().__init__(error)
+        self.response = Response({"error": error}, status=status)
+
+
+def _own_ow_user(patient):
+    """The address of the patient's own OW user and the headers that reach it, or None when they
+    have none. Taken from the patient's own link, never the request, so nobody acts on another's."""
+    ow_user_id = patient.get_ow_user_id()
+    if not ow_user_id:
+        return None
+    ow_api_url = get_setting("ow.api_url", "")
+    ow_api_key = get_setting("ow.api_key", "")
+    if not ow_api_url or not ow_api_key:
+        raise _OwFailed(500, "OW integration not configured")
+    return f"{ow_api_url.rstrip('/')}/api/v1/users/{ow_user_id}", {"X-Open-Wearables-API-Key": ow_api_key}
+
+
+def _ow(method, url, headers, ok, timeout=10):
+    try:
+        response = getattr(requests, method)(url, headers=headers, timeout=timeout)
+    except requests.RequestException as e:
+        logger.error("Failed to reach OW API: %s", e)
+        raise _OwFailed(502, "Failed to reach OW API")
+    if response.status_code not in ok:
+        logger.error("OW %s %s answered %s: %s", method.upper(), url, response.status_code, response.text[:300])
+        raise _OwFailed(502, "OW error")
+    return response
+
+
+def _revoke_pairings(ow_user):
+    """OW's /token/revoke cannot unpair a phone: it needs the refresh token that is live now,
+    and OW rotates refresh tokens on every use. Revoking all of them can (our OW branch
+    revoke-all-sdk-tokens-for-a-user)."""
+    url, headers = ow_user
+    return _ow("post", f"{url}/tokens/revoke", headers, ok=(200,)).json().get("revoked", 0)
+
+
+def _sources_of(patient):
+    """The DataSources the patient's readings are filed under."""
+    return DataSource.objects.filter(observation__subject_patient=patient).distinct()
+
+
+def _patient_or_403(request, refusal):
+    """The caller's own patient, or the 403 to answer a practitioner with."""
+    patient = request.user.get_patient()
+    if patient is None:
+        return None, Response({"error": refusal}, status=403)
+    return patient, None
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def revoke_ow_pairings(request):
+    """
+    POST /api/v1/ow/pairings/revoke
+    Stops every phone paired to the caller, so a lost or retired phone stops uploading. Readings
+    already sent stay.
+    """
+    patient, refused = _patient_or_403(request, "Only a participant's own phones can be unpaired")
+    if refused:
+        return refused
+    try:
+        ow_user = _own_ow_user(patient)
+        return Response({"revoked": _revoke_pairings(ow_user) if ow_user else 0})
+    except _OwFailed as failed:
+        return failed.response
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_ow_sources(request):
+    """
+    GET /api/v1/ow/sources
+    The caller's own sources, grouped by the phone platform or cloud account each one comes in
+    through, live or in an uploaded export of it: what removing that provider deletes.
+    """
+    patient = request.user.get_patient()
+    groups = {}
+    for data_source in _sources_of(patient) if patient else []:
+        groups.setdefault(provider_of(data_source.name), set()).add(data_source.name)
+    return Response({"sources": [{"provider": p, "names": sorted(names)} for p, names in sorted(groups.items())]})
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def remove_ow_source(request, provider):
+    """
+    DELETE /api/v1/ow/sources/<provider>
+    Disconnects one of the caller's own phone platforms or cloud accounts and deletes every
+    reading it brought in, in Open Wearables and here. Readings from uploaded exports filed
+    under the same sources go too (see provider_of).
+
+    Open Wearables goes first, and a failure there deletes nothing here, so the call can be
+    repeated. A phone platform also has every pairing revoked first: a paired phone would
+    otherwise keep uploading and reconnect itself.
+    """
+    if provider not in PROVIDER_LABELS and provider not in PLATFORM_LABELS:
+        return Response({"error": "Unknown provider"}, status=400)
+    patient, refused = _patient_or_403(request, "Only a participant's own sources can be removed")
+    if refused:
+        return refused
+    try:
+        ow_user = _own_ow_user(patient)
+        if ow_user:
+            url, headers = ow_user
+            if provider in PLATFORM_LABELS:
+                _revoke_pairings(ow_user)
+            # OW deletes all of the provider's rows before it answers, which can take a while.
+            # 404: never connected, so OW holds nothing for it.
+            _ow("delete", f"{url}/connections/{provider}/data", headers, ok=(204, 404), timeout=120)
+    except _OwFailed as failed:
+        return failed.response
+
+    sources = [ds.id for ds in _sources_of(patient) if provider_of(ds.name) == provider]
+    # In SQL rather than QuerySet.delete(), which loads every row before deleting it: a year of
+    # a watch's heart rate is a hundred thousand documents.
+    with transaction.atomic(), connection.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM core_observationidentifier WHERE observation_id IN (SELECT id FROM core_observation"
+            " WHERE subject_patient_id = %s AND data_source_id = ANY(%s))",
+            [patient.id, sources],
+        )
+        cursor.execute(
+            "DELETE FROM core_observation WHERE subject_patient_id = %s AND data_source_id = ANY(%s)",
+            [patient.id, sources],
+        )
+        deleted = cursor.rowcount
+    return Response({"deleted": deleted})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def stop_ow_collecting(request):
+    """
+    POST /api/v1/ow/users/me/stop
+    Unpairs every phone and disconnects every cloud account of the caller, keeping what they
+    brought in: for someone who leaves but keeps their readings.
+    """
+    patient, refused = _patient_or_403(request, "Only a participant can stop their own collection")
+    if refused:
+        return refused
+    try:
+        ow_user = _own_ow_user(patient)
+        if ow_user:
+            url, headers = ow_user
+            _revoke_pairings(ow_user)
+            found = _ow("get", f"{url}/connections", headers, ok=(200,)).json()
+            for row in found if isinstance(found, list) else found.get("connections", []):
+                _ow("delete", f"{url}/connections/{row['provider']}", headers, ok=(200, 204, 404))
+    except _OwFailed as failed:
+        return failed.response
+    return Response(status=204)
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def delete_ow_user(request):
+    """
+    DELETE /api/v1/ow/users/me
+    Deletes the caller's OW user and every reading OW holds of them, which first deregisters
+    their cloud accounts at each provider, and the link to it. Readings already here stay, with
+    the patient. 404 from OW means the user is gone already.
+    """
+    patient, refused = _patient_or_403(request, "Only a participant can delete their own OW user")
+    if refused:
+        return refused
+    try:
+        ow_user = _own_ow_user(patient)
+        if ow_user:
+            url, headers = ow_user
+            _ow("delete", url, headers, ok=(200, 204, 404), timeout=120)
+    except _OwFailed as failed:
+        return failed.response
+    PatientIdentifier.objects.filter(patient=patient, system=OW_USER_ID_SYSTEM).delete()
+    return Response(status=204)
 
 
 @api_view(["GET"])
