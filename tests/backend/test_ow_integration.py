@@ -135,7 +135,7 @@ class TestCreateOwUser:
         # Verify OW API was called with correct payload
         mock_post.assert_called_once()
         call_args = mock_post.call_args
-        assert call_args[1]["json"]["email"] == "ow-test@example.org"
+        assert call_args[1]["json"] == {"external_user_id": str(ow_user.id)}
         assert "X-Open-Wearables-API-Key" in call_args[1]["headers"]
 
         # Verify the OW link was stored on the patient

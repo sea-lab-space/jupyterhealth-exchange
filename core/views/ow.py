@@ -87,13 +87,10 @@ def create_ow_user(request):
         tokens = _sdk_token(ow_api_url, ow_user_id) if include_tokens else {}
         return Response({"ow_user_id": ow_user_id, **tokens})
 
-    # Create user in OW
-    payload = {
-        "email": user.email,
-        "first_name": user.first_name if user.first_name != "NONE" else None,
-        "last_name": user.last_name if user.last_name != "NONE" else None,
-        "external_user_id": str(user.id),
-    }
+    # Create user in OW. OW needs no name or email, so it is given none: the readings it holds
+    # stay unnamed, and an email it already has cannot block the link. The PatientIdentifier
+    # stored below is what ties the two together.
+    payload = {"external_user_id": str(user.id)}
 
     try:
         ow_response = requests.post(
