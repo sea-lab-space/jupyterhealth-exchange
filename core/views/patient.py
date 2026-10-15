@@ -244,6 +244,29 @@ class PatientViewSet(ModelViewSet):
         PatientOrganization.objects.create(organization_id=organization.id, patient_id=patient.id)
         return Response(PatientSerializer(patient, many=False).data, status=200)
 
+    @action(detail=True, methods=["POST"])
+    def leave_organization(self, request, pk):
+        """POST /api/v1/patients/{id}/leave_organization?organization_id= - The patient leaves an
+        organization, so its practitioners can no longer read them. Its studies drop them, with
+        their consents. Unlike ``destroy``, a patient left in no organization keeps their account
+        and observations. Only the patient themselves can do this; leaving twice is not an error.
+        """
+        patient = request.user.get_patient()
+        if patient is None or patient.id != int(pk):
+            raise PermissionDenied("Only the patient can leave an organization.")
+        try:
+            organization_id = int(request.GET["organization_id"])
+        except (KeyError, ValueError):
+            raise ValidationError("organization_id parameter required")
+        with transaction.atomic():
+            StudyPatientScopeConsent.objects.filter(
+                study_patient__patient=patient,
+                study_patient__study__organization_id=organization_id,
+            ).delete()
+            StudyPatient.objects.filter(patient=patient, study__organization_id=organization_id).delete()
+            PatientOrganization.objects.filter(patient=patient, organization_id=organization_id).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(detail=True, methods=["GET"])
     def consolidated_clients(self, request, pk):
         Client = get_application_model()
