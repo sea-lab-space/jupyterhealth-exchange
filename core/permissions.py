@@ -44,7 +44,8 @@ ROLE_PERMISSIONS = {
         "patient.manage_data",
         "study.manage_for_organization",
     ],
-    "viewer": [],
+    # A viewer sees who else is in their organization, not only its studies and patients.
+    "viewer": ["organization.view_members"],
 }
 
 

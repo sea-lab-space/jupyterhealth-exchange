@@ -724,9 +724,9 @@ async function renderOrganizations(queryParams) {
     }
 
     if (queryParams.read) {
-      // The member roster requires "organization.view_members" (managers/members, not
-      // viewers, and not an org where the user has no direct role at all -- e.g. one
-      // that's only visible as an ancestor of an org they belong to).
+      // The member roster requires "organization.view_members" (any direct role, but
+      // not an org where the user has no direct role at all -- e.g. one that's only
+      // visible as an ancestor of an org they belong to).
       if (ifRoleCan(organizationRecord.currentUserRole, "organization.view_members")) {
         const organizationUsersResponse = await apiRequest(
           "GET",

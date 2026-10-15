@@ -51,7 +51,7 @@ def test_organization_visibility_scoping(api_client, organization):
     assert r.status_code == 403, r.text
 
 
-def test_viewer_cannot_view_organization_members(organization):
+def test_viewer_can_view_organization_members(organization):
     viewer_user = JheUser.objects.create_user(
         email="org-viewer@example.org",
         user_type="practitioner",
@@ -66,10 +66,11 @@ def test_viewer_cannot_view_organization_members(organization):
     client.force_authenticate(viewer_user)
 
     r = client.get(f"/api/v1/organizations/{organization.id}/users")
-    assert r.status_code == 403, r.text
+    assert r.status_code == 200, r.text
+    assert {"email": "org-viewer@example.org", "role": "viewer"}.items() <= next(
+        u for u in r.json() if u["email"] == "org-viewer@example.org"
+    ).items()
 
-    # A viewer can still see the org itself and its tree -- only the member roster is
-    # restricted.
     r = client.get(f"/api/v1/organizations/{organization.id}")
     assert r.status_code == 200, r.text
     r = client.get(f"/api/v1/organizations/{organization.id}/tree")
