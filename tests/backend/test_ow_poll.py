@@ -484,8 +484,8 @@ def test_skips_user_without_ow_identifier(db, patient_with_consent, hr_concept):
     assert Observation.objects.count() == 0
 
 
-def test_skips_patient_without_hr_consent(db, organization, hr_concept):
-    """A patient with an OW link but no HR scope consent must be skipped."""
+def test_polls_patient_without_hr_consent(db, organization, hr_concept):
+    """A patient with an OW link keeps their readings without consenting, as their own upload would."""
     from core.models import JheUser
 
     _set_jhe_setting("module.ow", True)
@@ -499,11 +499,18 @@ def test_skips_patient_without_hr_consent(db, organization, hr_concept):
     user.patient.organizations.add(organization)
     PatientIdentifier.objects.create(patient=user.patient, system=OW_USER_ID_SYSTEM, value="user-no-consent")
 
-    with patch("core.management.commands.ow_poll.requests.get") as mock_get:
+    with (
+        patch("core.management.commands.ow_poll.requests.get") as mock_get,
+        patch("core.management.commands.ow_poll.convert") as mock_convert,
+    ):
+        mock_get.return_value.status_code = 200
+        _serve_heart_rate_only(mock_get)
+        mock_get.return_value.json.return_value = {"data": [{"timestamp": "2024-01-01T00:00:00Z", "value": 72}]}
+        mock_convert.return_value = _fake_omh_record()
+
         call_command("ow_poll", stdout=StringIO())
 
-    mock_get.assert_not_called()
-    assert Observation.objects.count() == 0
+    assert Observation.objects.filter(subject_patient=user.patient, codeable_concept=hr_concept).count() == 1
 
 
 def test_lock_released_on_exception(db, ow_user, hr_concept):
@@ -1207,7 +1214,7 @@ def test_a_patients_lock_is_released_when_their_poll_fails(db, ow_user, patient_
     _clear_sync_lock()
 
     with (
-        patch("core.models.Patient.consolidated_consented_scopes", side_effect=RuntimeError("boom")),
+        patch("core.models.Patient.get_ow_user_id", side_effect=RuntimeError("boom")),
         pytest.raises(RuntimeError),
     ):
         call_command("ow_poll", stdout=StringIO())

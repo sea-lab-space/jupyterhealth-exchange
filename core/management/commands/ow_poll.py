@@ -31,8 +31,10 @@ OW connection config (``ow.api_url``, ``ow.api_key``) is read from JheSettings
 via ``get_setting()``, matching ``core/views/ow.py``.
 
 ``OW_TYPE_TO_CODE`` maps each polled type to the CodeableConcept its
-Observations are filed under, and is intersected with the patient's consented
-scopes so a poll can never widen consent. A type only belongs there once
+Observations are filed under. Every type is polled for every linked patient,
+consented or not, as a patient's own upload is stored
+(``core.services.observation_import``): the readings are theirs, and who reads
+them is decided when they are read. A type only belongs there once
 omh-shim converts it to a schema id JHE can resolve: ``core/utils.py`` resolves
 the ``omh`` and ``ieee`` namespaces only, which is why ``heart_rate_variability``
 is absent (omh-shim 2.0 dropped the ``local:heart-rate-variability:1.0`` schema
@@ -465,14 +467,10 @@ class Command(BaseCommand):
         """Poll one patient for every type, under their lock. Returns how many rows were created."""
         user = patient.jhe_user
         with _patient_lock(patient):
-            consented_codes = {s.coding_code for s in patient.consolidated_consented_scopes()}
-            polled = {t: c for t, c in run.codes.items() if c.coding_code in consented_codes}
-            if not polled:
-                return 0
             ow_user_id = patient.get_ow_user_id()
 
             created = 0
-            for ow_type, code in polled.items():
+            for ow_type, code in run.codes.items():
                 try:
                     if run.mode == "normalized":
                         fetcher = self._normalized_fetcher(user, ow_user_id, run.ow_api_url, run.ow_api_key, ow_type)
