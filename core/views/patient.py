@@ -1,7 +1,8 @@
 import inspect
 import logging
-from datetime import datetime
+from datetime import UTC, date, datetime
 
+from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError, transaction
@@ -10,7 +11,7 @@ from django.utils.crypto import get_random_string
 from oauth2_provider.models import get_application_model
 from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 
@@ -42,7 +43,18 @@ from core.serializers import (
     StudyPatientScopeConsentSerializer,
     StudyPendingConsentsSerializer,
 )
+from core.services import observation_rollup
 from core.services.jhe_settings import get_setting
+
+
+def _instant(value):
+    """A date (midnight UTC) or an ISO date-time."""
+    moment = (
+        datetime.fromisoformat(value)
+        if "T" in value
+        else datetime.combine(date.fromisoformat(value), datetime.min.time())
+    )
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
 
 class PatientViewSet(ModelViewSet):
@@ -273,6 +285,70 @@ class PatientViewSet(ModelViewSet):
         patient = self.get_object()
         sources = FhirSource.objects.filter(patient=patient).select_related("data_source").order_by("id")
         return Response(PatientFhirSourceSerializer(sources, many=True).data)
+
+    @action(detail=True, methods=["GET"])
+    def daily(self, request, pk):
+        """GET /api/v1/patients/{id}/daily - readings rolled up per day, measure and source.
+
+        ``?days=N`` covers the N days up to the patient's newest reading (180 by default), or
+        ``?start=YYYY-MM-DD&end=YYYY-MM-DD`` a range. ``?codes=`` (comma-separated) limits the
+        measures and ``?study_id=`` narrows a practitioner's view to what that study asks for.
+        Also returns every source's span over the whole history and its newest reading of each
+        measure. See core/services/observation_rollup.py.
+        """
+        observations = self._rolled_up(request, pk)
+        try:
+            days = int(request.GET["days"]) if request.GET.get("days") else None
+            start = date.fromisoformat(request.GET["start"]) if request.GET.get("start") else None
+            end = date.fromisoformat(request.GET["end"]) if request.GET.get("end") else None
+        except ValueError:
+            raise ValidationError("days must be a number; start and end must be YYYY-MM-DD.")
+        if (days is not None and not 1 <= days <= 3660) or (start and end and not 0 <= (end - start).days <= 3660):
+            raise ValidationError("Ask for between 1 and 3660 days.")
+        start, end = observation_rollup.window(observations, days, start, end)
+        return Response(observation_rollup.rollup(observations, start, end))
+
+    @action(detail=True, methods=["GET"])
+    def series(self, request, pk):
+        """GET /api/v1/patients/{id}/series - one measure's readings averaged per interval and source.
+
+        ``?code=`` names the measure, ``?start=`` (a date or date-time; dates are UTC) and
+        optionally ``?end=`` the span, ``?minutes=`` the interval (15 by default). For charts of a
+        few days of dense readings, where fetching every reading would be slow. ``?study_id=`` as
+        for ``daily``.
+        """
+        observations = self._rolled_up(request, pk)
+        try:
+            code = request.GET["code"]
+            start = _instant(request.GET["start"])
+            end = _instant(request.GET["end"]) if request.GET.get("end") else timezone.now()
+            minutes = int(request.GET.get("minutes") or 15)
+        except (KeyError, ValueError):
+            raise ValidationError("code and start are required; start and end are dates or date-times.")
+        if not 1 <= minutes <= 1440 or not start < end or (end - start).total_seconds() / 60 / minutes > 20_000:
+            raise ValidationError("Ask for a span after its start, in at most 20,000 intervals of 1 to 1440 minutes.")
+        return Response(observation_rollup.series(observations, code, start, end, minutes))
+
+    @action(detail=True, methods=["GET"])
+    def deliveries(self, request, pk):
+        """GET /api/v1/patients/{id}/deliveries - how many readings have arrived and when the newest
+        did, by when JHE stored them. ``?codes=`` and ``?study_id=`` as for ``daily``."""
+        return Response(observation_rollup.deliveries(self._rolled_up(request, pk)))
+
+    def _rolled_up(self, request, pk):
+        """The patient's observations the caller may read, as ``?codes=`` and ``?study_id=`` ask."""
+        patient = Patient.objects.filter(pk=pk).first()
+        if patient is None:
+            raise NotFound("Patient not found.")
+        codes = [c for c in request.GET.get("codes", "").split(",") if c] or None
+        try:
+            study_id = int(request.GET["study_id"]) if request.GET.get("study_id") else None
+        except ValueError:
+            raise ValidationError("study_id must be a number.")
+        try:
+            return observation_rollup.visible(patient, request.user, study_id, codes)
+        except DjangoPermissionDenied as error:
+            raise PermissionDenied(str(error))
 
     @action(detail=False, methods=["GET"])
     def me(self, request):

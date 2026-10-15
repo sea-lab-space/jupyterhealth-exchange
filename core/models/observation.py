@@ -34,6 +34,9 @@ class Observation(models.Model):
     data_source = models.ForeignKey("DataSource", on_delete=models.SET_NULL, null=True, blank=True)
     omh_data = models.JSONField(null=True)
     last_updated = models.DateTimeField(auto_now=True)
+    # When JHE first stored it. last_updated moves with every revision, so it cannot say when a
+    # reading arrived.
+    created = models.DateTimeField(auto_now_add=True)
     ow_key = models.TextField(null=True, blank=True, db_index=True)
 
     # Timing elevated out of the omh_data blob so it can be queried at the DB level and rendered
