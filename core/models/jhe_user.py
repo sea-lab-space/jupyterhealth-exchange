@@ -8,7 +8,6 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.mail import EmailMessage
 from django.db import connection, models, transaction
 from django.template.loader import render_to_string
-from django.utils import timezone
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from django.utils.translation import gettext_lazy as _
@@ -175,7 +174,9 @@ class JheUser(AbstractUser):
                         jhe_user=self,
                         name_family=self.last_name or "",
                         name_given=self.first_name or "",
-                        birth_date=timezone.now().date(),  # TBD, do we want a default value equivalent to this?
+                        # Unknown until someone enters it; the day the account was made is no one's
+                        # birth date.
+                        birth_date=None,
                     )
                 elif self.user_type == "practitioner" and not hasattr(self, "practitioner_profile"):
                     practitioner = Practitioner.objects.create(
