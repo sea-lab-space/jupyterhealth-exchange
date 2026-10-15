@@ -5,10 +5,11 @@ from core.models import (
     StudyClient,
     StudyDataSource,
     StudyPatient,
+    StudyPatientScopeConsent,
     StudyScopeRequest,
 )
 
-from .utils import Code, add_patients, fetch_paginated
+from .utils import Code, add_patient_to_study, add_patients, create_study, fetch_paginated
 
 Application = get_application_model()
 
@@ -132,6 +133,19 @@ def test_add_remove_scope_requests(api_client, hr_study):
     r = api_client.delete(url, {"scope_code_id": bp.id})
     assert r.status_code == 204, r.text
     assert StudyScopeRequest.objects.filter(study=hr_study, scope_code=bp).count() == 0
+
+
+def test_removing_a_scope_request_removes_its_consents(api_client, organization, patient, hr_study):
+    """A consent answers its study's request, so it goes with the request, and only that study's."""
+    other = create_study("other", organization=organization, codes=[Code.HeartRate])
+    add_patient_to_study(patient=patient, study=other)
+    hr = CodeableConcept.objects.get(coding_code=Code.HeartRate.value)
+
+    r = api_client.delete(f"/api/v1/studies/{hr_study.id}/scope_requests", {"scope_code_id": hr.id})
+
+    assert r.status_code == 204, r.text
+    consents = StudyPatientScopeConsent.objects.filter(study_patient__patient=patient, scope_code=hr)
+    assert [c.study_patient.study_id for c in consents] == [other.id]
 
 
 def test_get_study_clients(api_client, hr_study):

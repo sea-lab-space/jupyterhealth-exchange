@@ -1,5 +1,6 @@
 import logging
 
+from django.db import transaction
 from pydantic import ValidationError
 from rest_framework import status
 from rest_framework.decorators import action
@@ -7,7 +8,15 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 
-from core.models import Patient, Study, StudyClient, StudyDataSource, StudyPatient, StudyScopeRequest
+from core.models import (
+    Patient,
+    Study,
+    StudyClient,
+    StudyDataSource,
+    StudyPatient,
+    StudyPatientScopeConsent,
+    StudyScopeRequest,
+)
 from core.pagination import CustomPageNumberPagination
 from core.permissions import IfUserCan
 from core.serializers import (
@@ -108,9 +117,15 @@ class StudyViewSet(ModelViewSet):
             if request.method == "POST":
                 response = StudyScopeRequest.objects.create(study_id=pk, scope_code_id=request.data["scope_code_id"])
             else:
-                response = StudyScopeRequest.objects.filter(
-                    study_id=pk, scope_code_id=request.data["scope_code_id"]
-                ).delete()
+                # A consent answers a request: with the request gone it answers nothing, and it
+                # must not come back as a yes if the study asks again.
+                with transaction.atomic():
+                    StudyPatientScopeConsent.objects.filter(
+                        study_patient__study_id=pk, scope_code_id=request.data["scope_code_id"]
+                    ).delete()
+                    response = StudyScopeRequest.objects.filter(
+                        study_id=pk, scope_code_id=request.data["scope_code_id"]
+                    ).delete()
 
             if request.method == "POST":
                 return Response(StudyScopeRequestSerializer(response, many=False).data, status=status.HTTP_201_CREATED)
